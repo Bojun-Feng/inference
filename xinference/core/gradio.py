@@ -18,6 +18,7 @@ import uuid
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import gradio as gr
+from pySmartDL import SmartDL
 
 from ..locale.utils import Locale
 from ..model import MODEL_FAMILIES, ModelSpec
@@ -282,17 +283,24 @@ class GradioApp:
                     f"{str(model_family)}-{_model_size_in_billions}b-{_quantization}"
                 )
                 try:
-                    urllib.request.urlretrieve(
-                        url,
-                        cache_path,
-                        reporthook=lambda block_num, block_size, total_size: progress(
-                            block_num * block_size / total_size,
+                    dl = SmartDL(url, cache_path)
+                    dl.start(blocking=False)
+
+                    while not dl.isFinished():
+                        # Here, we calculate the progress and update the progress bar accordingly.
+                        current_progress = dl.get_progress() * 100
+                        progress(
+                            current_progress,
                             desc=self._locale("Downloading"),
-                        ),
-                    )
-                    # write a meta file to record if download finished
-                    with open(meta_path, "w") as f:
-                        f.write(full_name)
+                        )
+
+                    if dl.isSuccessful():
+                        # write a meta file to record if download finished
+                        with open(meta_path, "w") as f:
+                            f.write(full_name)
+                    else:
+                        print(f"Download failed with errors: {dl.get_errors()}")
+
                 except:
                     if os.path.exists(cache_path):
                         os.remove(cache_path)

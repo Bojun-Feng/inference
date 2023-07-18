@@ -18,6 +18,7 @@ import urllib.request
 from typing import Callable, List, Optional, Type
 
 from tqdm import tqdm
+from pySmartDL import SmartDL
 
 from ..constants import XINFERENCE_CACHE_DIR
 
@@ -169,24 +170,24 @@ class ModelFamily:
         try:
             if os.path.exists(save_path):
                 os.remove(save_path)
-            with tqdm(
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                miniters=1,
-                desc=f"Downloading {full_name}",
-            ) as progress:
-                urllib.request.urlretrieve(
-                    url,
-                    save_path,
-                    reporthook=lambda blocknum, blocksize, totalsize: progress.update(
-                        blocksize
-                    ),
-                )
-            # write a meta file to record if download finished
-            with open(meta_path, "w") as f:
-                f.write(full_name)
-            # TODO: verify the integrity.
+            
+            dl = SmartDL(url, save_path)
+            dl.start(blocking=False)
+
+            while not dl.isFinished():
+                # You can perform other tasks while downloading.
+                # Displaying download progress.
+                print(f"Downloading {full_name}, progress: {dl.get_progress()*100}%")
+
+            if dl.isSuccessful():
+                # write a meta file to record if download finished
+                with open(meta_path, "w") as f:
+                    f.write(full_name)
+                # TODO: verify the integrity.
+            else:
+                print(f"Download failed with errors: {dl.get_errors()}")
+                raise RuntimeError(f"Failed to download {full_name} from {url}")
+
         except:
             if os.path.exists(save_path):
                 os.remove(save_path)
