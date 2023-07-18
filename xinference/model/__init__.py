@@ -14,11 +14,13 @@
 
 import logging
 import os
+import shutil
 import urllib.request
 from typing import Callable, List, Optional, Type
 
 from tqdm import tqdm
 from pySmartDL import SmartDL
+from pathlib import Path
 
 from ..constants import XINFERENCE_CACHE_DIR
 
@@ -177,7 +179,7 @@ class ModelFamily:
             while not dl.isFinished():
                 # You can perform other tasks while downloading.
                 # Displaying download progress.
-                print(f"Downloading {full_name}, progress: {dl.get_progress()*100}%")
+                print(f"Downloading {full_name}, progress: {dl.get_progress()}%")
 
             if dl.isSuccessful():
                 # write a meta file to record if download finished
@@ -189,8 +191,10 @@ class ModelFamily:
                 raise RuntimeError(f"Failed to download {full_name} from {url}")
 
         except:
-            if os.path.exists(save_path):
-                os.remove(save_path)
+            parent_dir = Path(save_path).parent
+            if os.path.exists(parent_dir):
+                grandparent_dir = parent_dir.parent
+                shutil.rmtree(grandparent_dir / parent_dir.name)
             raise RuntimeError(f"Failed to download {full_name} from {url}")
 
         return save_path

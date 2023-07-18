@@ -13,12 +13,14 @@
 # limitations under the License.
 
 import os
+import shutil
 import urllib.request
 import uuid
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import gradio as gr
 from pySmartDL import SmartDL
+from pathlib import Path
 
 from ..locale.utils import Locale
 from ..model import MODEL_FAMILIES, ModelSpec
@@ -288,7 +290,7 @@ class GradioApp:
 
                     while not dl.isFinished():
                         # Here, we calculate the progress and update the progress bar accordingly.
-                        current_progress = dl.get_progress() * 100
+                        current_progress = dl.get_progress()
                         progress(
                             current_progress,
                             desc=self._locale("Downloading"),
@@ -302,8 +304,10 @@ class GradioApp:
                         print(f"Download failed with errors: {dl.get_errors()}")
 
                 except:
-                    if os.path.exists(cache_path):
-                        os.remove(cache_path)
+                    parent_dir = Path(cache_path).parent
+                    if os.path.exists(parent_dir):
+                        grandparent_dir = parent_dir.parent
+                        shutil.rmtree(grandparent_dir / parent_dir.name)
 
             model_uid = self._create_model(
                 _model_name, int(_model_size_in_billions), _model_format, _quantization
