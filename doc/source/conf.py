@@ -75,7 +75,7 @@ if not version_match:
 
 html_theme_options = {
     "show_toc_level": 2,
-    "header_links_before_dropdown": 6,
+    "header_links_before_dropdown": 7,
     "icon_links": [
         {
             "name": "GitHub",
@@ -96,9 +96,9 @@ html_theme_options = {
 
 if version_match != 'zh-cn':
     html_theme_options['icon_links'].extend([{
-        "name": "Slack",
-        "url": "https://join.slack.com/t/xorbitsio/shared_invite/zt-1o3z9ucdh-RbfhbPVpx7prOVdM1CAuxg",
-        "icon": "fa-brands fa-slack",
+        "name": "Discord",
+        "url": "https://discord.gg/Xw9tszSkr5",
+        "icon": "fa-brands fa-discord",
         "type": "fontawesome",
     },
     {
@@ -110,7 +110,7 @@ if version_match != 'zh-cn':
 else:
     html_theme_options['icon_links'].extend([{
         "name": "WeChat",
-        "url": "https://xorbits.cn/assets/images/wechat_pr.png",
+        "url": "https://xorbits.cn/assets/images/wechat_work_qr.png",
         "icon": "fa-brands fa-weixin",
         "type": "fontawesome",
     },
@@ -121,7 +121,7 @@ else:
         "type": "fontawesome",
     }])
     html_theme_options["external_links"] = [
-        {"name": "产品官网", "url": "https://xorbits.cn/inference"},
+        {"name": "产品官网", "url": "https://xorbits.cn"},
     ]
 
 html_favicon = "_static/favicon.svg"

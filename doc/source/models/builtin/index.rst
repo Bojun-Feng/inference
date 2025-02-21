@@ -4,10 +4,12 @@
 Builtin Models
 ==============
 
-
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
 
    llm/index
    embedding/index
+   image/index
+   audio/index
    rerank/index
+   video/index

@@ -22,7 +22,6 @@ import pytest
 import requests
 
 from ...constants import XINFERENCE_ENV_MODEL_SRC
-from ..oscar.actor_client import ActorClient, ChatModelHandle, EmbeddingModelHandle
 from ..restful.restful_client import Client as RESTfulClient
 from ..restful.restful_client import (
     RESTfulChatModelHandle,
@@ -32,213 +31,16 @@ from ..restful.restful_client import (
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Skip windows")
-@pytest.mark.asyncio
-async def test_client(setup):
-    endpoint, _ = setup
-    client = ActorClient(endpoint)
-    assert len(client.list_models()) == 0
-
-    model_uid = client.launch_model(
-        model_name="orca", model_size_in_billions=3, quantization="q4_0"
-    )
-    assert len(client.list_models()) == 1
-
-    model = client.get_model(model_uid=model_uid)
-    assert isinstance(model, ChatModelHandle)
-
-    completion = model.chat("write a poem.")
-    assert "content" in completion["choices"][0]["message"]
-
-    completion = model.chat("write a poem.", generate_config={"stream": True})
-    with pytest.raises(Exception, match="Parallel generation"):
-        model.chat("write a poem.", generate_config={"stream": True})
-    await completion.destroy()
-    completion = model.chat("write a poem.", generate_config={"stream": True})
-    async for chunk in completion:
-        assert chunk
-
-    client.terminate_model(model_uid=model_uid)
-    assert len(client.list_models()) == 0
-
-    model_uid = client.launch_model(
-        model_name="orca",
-        model_size_in_billions=3,
-        quantization="q4_0",
-    )
-
-    model = client.get_model(model_uid=model_uid)
-
-    embedding_res = model.create_embedding("The food was delicious and the waiter...")
-    embedding_res = json.loads(embedding_res)
-    assert "embedding" in embedding_res["data"][0]
-
-    client.terminate_model(model_uid=model_uid)
-    assert len(client.list_models()) == 0
-
-    with pytest.raises(ValueError):
-        client.launch_model(
-            model_name="orca", model_size_in_billions=3, quantization="q4_0", n_gpu=100
-        )
-
-    with pytest.raises(ValueError):
-        client.launch_model(
-            model_name="orca",
-            model_size_in_billions=3,
-            quantization="q4_0",
-            n_gpu="abcd",
-        )
-
-
-def test_client_for_model_uid(setup):
-    endpoint, _ = setup
-    client = ActorClient(endpoint)
-    assert len(client.list_models()) == 0
-
-    model_uid = client.launch_model(
-        model_name="orca", model_size_in_billions=3, quantization="q4_0"
-    )
-    assert len(client.list_models()) == 1
-    assert model_uid == "orca"
-
-    model_uid2 = client.launch_model(
-        model_name="orca", model_size_in_billions=3, quantization="q4_0"
-    )
-    assert len(client.list_models()) == 2
-    assert len(model_uid2) == len("orca") + 9
-    assert model_uid2.startswith("orca")
-
-    client.terminate_model(model_uid=model_uid)
-    client.terminate_model(model_uid=model_uid2)
-    assert len(client.list_models()) == 0
-
-
-def test_client_for_embedding(setup):
-    endpoint, _ = setup
-    client = ActorClient(endpoint)
-    assert len(client.list_models()) == 0
-
-    model_uid = client.launch_model(
-        model_name="jina-embeddings-v2-small-en", model_type="embedding"
-    )
-    assert len(client.list_models()) == 1
-
-    model = client.get_model(model_uid=model_uid)
-    assert isinstance(model, EmbeddingModelHandle)
-
-    completion = model.create_embedding("write a poem.")
-    completion = json.loads(completion)
-    assert len(completion["data"][0]["embedding"]) == 512
-
-    client.terminate_model(model_uid=model_uid)
-    assert len(client.list_models()) == 0
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Skip windows")
-def test_replica_model(setup):
-    endpoint, _ = setup
-    client = ActorClient(endpoint)
-    assert len(client.list_models()) == 0
-
-    # Windows CI has limited resources, use replica 1
-    replica = 1 if os.name == "nt" else 2
-    model_uid = client.launch_model(
-        model_name="orca",
-        model_size_in_billions=3,
-        quantization="q4_0",
-        replica=replica,
-    )
-    # Only one model with 2 replica
-    assert len(client.list_models()) == 1
-
-    replica_uids = set()
-    while len(replica_uids) != replica:
-        model = client.get_model(model_uid=model_uid)
-        replica_uids.add(model._model_ref.uid)
-
-    embedding_res = model.create_embedding("The food was delicious and the waiter...")
-    embedding_res = json.loads(embedding_res)
-    assert "embedding" in embedding_res["data"][0]
-
-    client2 = RESTfulClient(endpoint)
-    info = client2.describe_model(model_uid=model_uid)
-    assert "address" in info
-    assert "accelerators" in info
-    assert info["replica"] == replica
-
-    client.terminate_model(model_uid=model_uid)
-    assert len(client.list_models()) == 0
-
-
-def test_client_custom_model(setup):
-    endpoint, _ = setup
-    client = ActorClient(endpoint)
-
-    model_regs = client.list_model_registrations(model_type="LLM")
-    assert len(model_regs) > 0
-    for model_reg in model_regs:
-        assert model_reg["is_builtin"]
-
-    model = """{
-  "version": 1,
-  "context_length":2048,
-  "model_name": "custom_model",
-  "model_lang": [
-    "en", "zh"
-  ],
-  "model_ability": [
-    "embed",
-    "chat"
-  ],
-  "model_specs": [
-    {
-      "model_format": "pytorch",
-      "model_size_in_billions": 7,
-      "quantizations": [
-        "4-bit",
-        "8-bit",
-        "none"
-      ],
-      "model_id": "ziqingyang/chinese-alpaca-2-7b"
-    }
-  ],
-  "prompt_style": {
-    "style_name": "ADD_COLON_SINGLE",
-    "system_prompt": "Below is an instruction that describes a task. Write a response that appropriately completes the request.",
-    "roles": [
-      "Instruction",
-      "Response"
-    ],
-    "intra_message_sep": "\\n\\n### "
-  }
-}"""
-    client.register_model(model_type="LLM", model=model, persist=False)
-
-    new_model_regs = client.list_model_registrations(model_type="LLM")
-    assert len(new_model_regs) == len(model_regs) + 1
-    custom_model_reg = None
-    for model_reg in new_model_regs:
-        if model_reg["model_name"] == "custom_model":
-            custom_model_reg = model_reg
-    assert custom_model_reg is not None
-
-    client.unregister_model(model_type="LLM", model_name="custom_model")
-    new_model_regs = client.list_model_registrations(model_type="LLM")
-    assert len(new_model_regs) == len(model_regs)
-    custom_model_reg = None
-    for model_reg in new_model_regs:
-        if model_reg["model_name"] == "custom_model":
-            custom_model_reg = model_reg
-    assert custom_model_reg is None
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Skip windows")
 def test_RESTful_client(setup):
     endpoint, _ = setup
     client = RESTfulClient(endpoint)
     assert len(client.list_models()) == 0
 
     model_uid = client.launch_model(
-        model_name="orca", model_size_in_billions=3, quantization="q4_0"
+        model_name="qwen1.5-chat",
+        model_engine="llama.cpp",
+        model_size_in_billions="0_5",
+        quantization="q4_0",
     )
     assert len(client.list_models()) == 1
 
@@ -271,16 +73,24 @@ def test_RESTful_client(setup):
     with pytest.raises(RuntimeError):
         completion = model.chat({"max_tokens": 64})
 
-    completion = model.chat("What is the capital of France?")
+    messages = [{"role": "user", "content": "What is the capital of France?"}]
+    completion = model.chat(messages)
     assert "content" in completion["choices"][0]["message"]
 
     def _check_stream():
         streaming_response = model.chat(
-            prompt="What is the capital of France?",
+            messages,
             generate_config={"stream": True, "max_tokens": 5},
         )
         for chunk in streaming_response:
-            assert "content" or "role" in chunk["choices"][0]["delta"]
+            assert "finish_reason" in chunk["choices"][0]
+            finish_reason = chunk["choices"][0]["finish_reason"]
+            if finish_reason is None:
+                assert ("content" in chunk["choices"][0]["delta"]) or (
+                    "role" in chunk["choices"][0]["delta"]
+                )
+            else:
+                assert chunk["choices"][0]["delta"] == {}
 
     _check_stream()
 
@@ -289,15 +99,9 @@ def test_RESTful_client(setup):
         for _ in range(2):
             r = executor.submit(_check_stream)
             results.append(r)
-    # Parallel generation is not supported by ggml.
-    error_count = 0
+
     for r in results:
-        try:
-            r.result()
-        except Exception as ex:
-            assert "Parallel generation" in str(ex)
-            error_count += 1
-    assert error_count == 1
+        r.result()
 
     # After iteration finish, we can iterate again.
     _check_stream()
@@ -307,6 +111,7 @@ def test_RESTful_client(setup):
 
     model_uid = client.launch_model(
         model_name="tiny-llama",
+        model_engine="llama.cpp",
         model_size_in_billions=1,
         model_format="ggufv2",
         quantization="q2_K",
@@ -332,18 +137,12 @@ def test_RESTful_client(setup):
 
     for stream in [True, False]:
         results = []
-        error_count = 0
         with ThreadPoolExecutor() as executor:
             for _ in range(3):
                 r = executor.submit(_check, stream=stream)
                 results.append(r)
         for r in results:
-            try:
-                r.result()
-            except Exception as ex:
-                assert "Parallel generation" in str(ex)
-                error_count += 1
-        assert error_count == (2 if stream else 0)
+            r.result()
 
     client.terminate_model(model_uid=model_uid)
     assert len(client.list_models()) == 0
@@ -352,18 +151,22 @@ def test_RESTful_client(setup):
         client.terminate_model(model_uid=model_uid)
 
     model_uid2 = client.launch_model(
-        model_name="orca",
-        model_size_in_billions=3,
+        model_name="qwen1.5-chat",
+        model_engine="llama.cpp",
+        model_size_in_billions="0_5",
         quantization="q4_0",
     )
 
-    model2 = client.get_model(model_uid=model_uid2)
-
-    embedding_res = model2.create_embedding("The food was delicious and the waiter...")
-    assert "embedding" in embedding_res["data"][0]
-
     client.terminate_model(model_uid=model_uid2)
     assert len(client.list_models()) == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Skip windows")
+def test_list_cached_models(setup):
+    endpoint, _ = setup
+    client = RESTfulClient(endpoint)
+    res = client.list_cached_models()
+    assert len(res) > 0
 
 
 def test_RESTful_client_for_embedding(setup):
@@ -401,9 +204,9 @@ def test_RESTful_client_custom_model(setup):
     "en", "zh"
   ],
   "model_ability": [
-    "embed",
     "chat"
   ],
+  "model_family": "other",
   "model_specs": [
     {
       "model_format": "pytorch",
@@ -416,15 +219,9 @@ def test_RESTful_client_custom_model(setup):
       "model_id": "ziqingyang/chinese-alpaca-2-7b"
     }
   ],
-  "prompt_style": {
-    "style_name": "ADD_COLON_SINGLE",
-    "system_prompt": "Below is an instruction that describes a task. Write a response that appropriately completes the request.",
-    "roles": [
-      "Instruction",
-      "Response"
-    ],
-    "intra_message_sep": "\\n\\n### "
-  }
+  "chat_template": "xyz",
+  "stop_token_ids": [],
+  "stop": []
 }"""
     client.register_model(model_type="LLM", model=model, persist=False)
 
@@ -448,7 +245,7 @@ def test_RESTful_client_custom_model(setup):
             custom_model_reg = model_reg
     assert custom_model_reg is None
 
-    # test register with string prompt style name
+    # test register with chat_template using model_family
     model_with_prompt = """{
   "version": 1,
   "context_length":2048,
@@ -460,6 +257,7 @@ def test_RESTful_client_custom_model(setup):
     "embed",
     "chat"
   ],
+  "model_family": "other",
   "model_specs": [
     {
       "model_format": "pytorch",
@@ -472,12 +270,12 @@ def test_RESTful_client_custom_model(setup):
       "model_id": "ziqingyang/chinese-alpaca-2-7b"
     }
   ],
-  "prompt_style": "qwen-chat"
+  "chat_template": "qwen-chat"
 }"""
     client.register_model(model_type="LLM", model=model_with_prompt, persist=False)
     client.unregister_model(model_type="LLM", model_name="custom_model")
 
-    model_with_prompt2 = """{
+    model_with_vision = """{
       "version": 1,
       "context_length":2048,
       "model_name": "custom_model",
@@ -485,9 +283,10 @@ def test_RESTful_client_custom_model(setup):
         "en", "zh"
       ],
       "model_ability": [
-        "embed",
-        "chat"
+        "chat",
+        "vision"
       ],
+      "model_family": "other",
       "model_specs": [
         {
           "model_format": "pytorch",
@@ -500,10 +299,41 @@ def test_RESTful_client_custom_model(setup):
           "model_id": "ziqingyang/chinese-alpaca-2-7b"
         }
       ],
-      "prompt_style": "xyz123"
+      "chat_template": "xyz123"
     }"""
     with pytest.raises(RuntimeError):
-        client.register_model(model_type="LLM", model=model_with_prompt2, persist=False)
+        client.register_model(model_type="LLM", model=model_with_vision, persist=False)
+
+    model_with_tool_call = """{
+          "version": 1,
+          "context_length":2048,
+          "model_name": "custom_model",
+          "model_lang": [
+            "en", "zh"
+          ],
+          "model_ability": [
+            "chat",
+            "tools"
+          ],
+          "model_family": "other",
+          "model_specs": [
+            {
+              "model_format": "pytorch",
+              "model_size_in_billions": 7,
+              "quantizations": [
+                "4-bit",
+                "8-bit",
+                "none"
+              ],
+              "model_id": "ziqingyang/chinese-alpaca-2-7b"
+            }
+          ],
+          "chat_template": "xyz123"
+        }"""
+    with pytest.raises(RuntimeError):
+        client.register_model(
+            model_type="LLM", model=model_with_tool_call, persist=False
+        )
 
 
 def test_client_from_modelscope(setup):
@@ -514,7 +344,9 @@ def test_client_from_modelscope(setup):
         client = RESTfulClient(endpoint)
         assert len(client.list_models()) == 0
 
-        model_uid = client.launch_model(model_name="tiny-llama")
+        model_uid = client.launch_model(
+            model_name="tiny-llama", model_engine="llama.cpp"
+        )
         assert len(client.list_models()) == 1
         model = client.get_model(model_uid=model_uid)
         completion = model.generate("write a poem.", generate_config={"max_tokens": 5})
@@ -580,6 +412,20 @@ def test_client_custom_embedding_model(setup):
 
 
 @pytest.fixture
+def set_auto_recover_limit():
+    os.environ["XINFERENCE_MODEL_ACTOR_AUTO_RECOVER_LIMIT"] = "1"
+    yield
+    del os.environ["XINFERENCE_MODEL_ACTOR_AUTO_RECOVER_LIMIT"]
+
+
+@pytest.fixture
+def set_test_oom_error():
+    os.environ["XINFERENCE_TEST_OUT_OF_MEMORY_ERROR"] = "1"
+    yield
+    del os.environ["XINFERENCE_TEST_OUT_OF_MEMORY_ERROR"]
+
+
+@pytest.fixture
 def setup_cluster():
     import xoscar as xo
 
@@ -589,7 +435,9 @@ def setup_cluster():
     from ...deploy.local import run_in_subprocess as supervisor_run_in_subprocess
 
     supervisor_address = f"localhost:{xo.utils.get_next_port()}"
-    local_cluster = supervisor_run_in_subprocess(supervisor_address, TEST_LOGGING_CONF)
+    local_cluster = supervisor_run_in_subprocess(
+        supervisor_address, None, None, TEST_LOGGING_CONF
+    )
 
     if not health_check(address=supervisor_address, max_attempts=20, sleep_interval=1):
         raise RuntimeError("Supervisor is not available after multiple attempts")
@@ -603,23 +451,26 @@ def setup_cluster():
             logging_conf=TEST_FILE_LOGGING_CONF,
         )
         endpoint = f"http://localhost:{port}"
-        if not api_health_check(endpoint, max_attempts=3, sleep_interval=5):
+        if not api_health_check(endpoint, max_attempts=10, sleep_interval=5):
             raise RuntimeError("Endpoint is not available after multiple attempts")
 
         yield f"http://localhost:{port}", supervisor_address
-        restful_api_proc.terminate()
+        restful_api_proc.kill()
     finally:
-        local_cluster.terminate()
+        local_cluster.kill()
 
 
-def test_auto_recover(setup_cluster):
+def test_auto_recover(set_auto_recover_limit, setup_cluster):
     endpoint, _ = setup_cluster
     current_proc = psutil.Process()
     chilren_proc = set(current_proc.children(recursive=True))
     client = RESTfulClient(endpoint)
 
     model_uid = client.launch_model(
-        model_name="orca", model_size_in_billions=3, quantization="q4_0"
+        model_name="qwen1.5-chat",
+        model_engine="llama.cpp",
+        model_size_in_billions="0_5",
+        quantization="q4_0",
     )
     new_children_proc = set(current_proc.children(recursive=True))
     model_proc = next(iter(new_children_proc - chilren_proc))
@@ -644,3 +495,22 @@ def test_auto_recover(setup_cluster):
             time.sleep(1)
     else:
         assert False
+
+
+def test_model_error(set_test_oom_error, setup_cluster):
+    endpoint, _ = setup_cluster
+    client = RESTfulClient(endpoint)
+
+    model_uid = client.launch_model(
+        model_name="qwen1.5-chat",
+        model_engine="llama.cpp",
+        model_size_in_billions="0_5",
+        quantization="q4_0",
+    )
+    assert len(client.list_models()) == 1
+
+    model = client.get_model(model_uid=model_uid)
+    assert isinstance(model, RESTfulChatModelHandle)
+
+    with pytest.raises(RuntimeError, match="Model actor is out of memory"):
+        model.generate("Once upon a time, there was a very old computer")

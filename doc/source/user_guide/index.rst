@@ -7,7 +7,10 @@ User Guide
 .. toctree::
    :maxdepth: 2
 
-   cache_management
    backends
    client_api
-   spec_decoding
+   auth_system
+   metrics
+   distributed_inference
+   continuous_batching
+   vllm_enhancement
