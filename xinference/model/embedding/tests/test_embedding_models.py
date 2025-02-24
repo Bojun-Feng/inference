@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import shutil
 import tempfile
@@ -46,6 +47,7 @@ TEST_MODEL_SPEC_FROM_MODELSCOPE = EmbeddingModelSpec(
     language=["zh"],
     model_id="Xorbits/bge-small-zh-v1.5",
     model_revision="v0.0.2",
+    model_hub="modelscope",
 )
 
 
@@ -53,7 +55,7 @@ def test_model():
     model_path = None
     try:
         model_path = cache(TEST_MODEL_SPEC)
-        model = EmbeddingModel("mock", model_path)
+        model = EmbeddingModel("mock", model_path, TEST_MODEL_SPEC)
         # input is a string
         input_text = "what is the capital of China?"
         model.load()
@@ -74,6 +76,12 @@ def test_model():
         assert len(r["data"]) == 4
         for d in r["data"]:
             assert len(d["embedding"]) == 384
+        n_token = 0
+        for inp in input_texts:
+            input_ids = model._model.tokenize([inp])["input_ids"]
+            n_token += input_ids.shape[-1]
+        assert r["usage"]["total_tokens"] == n_token
+
     finally:
         if model_path is not None:
             shutil.rmtree(model_path, ignore_errors=True)
@@ -81,7 +89,7 @@ def test_model():
 
 def test_model_from_modelscope():
     model_path = cache(TEST_MODEL_SPEC_FROM_MODELSCOPE)
-    model = EmbeddingModel("mock", model_path)
+    model = EmbeddingModel("mock", model_path, TEST_MODEL_SPEC_FROM_MODELSCOPE)
     # input is a string
     input_text = "乱条犹未变初黄，倚得东风势便狂。解把飞花蒙日月，不知天地有清霜。"
     model.load()
@@ -89,6 +97,7 @@ def test_model_from_modelscope():
     assert len(r["data"]) == 1
     for d in r["data"]:
         assert len(d["embedding"]) == 512
+    shutil.rmtree(model_path, ignore_errors=True)
 
 
 def test_meta_file():
@@ -105,7 +114,7 @@ def test_meta_file():
         assert valid_model_revision(meta_path, TEST_MODEL_SPEC2.model_revision)
 
         # test functionality of the new version model
-        model = EmbeddingModel("mock", cache_dir)
+        model = EmbeddingModel("mock", cache_dir, TEST_MODEL_SPEC2)
         input_text = "I can do this all day."
         model.load()
         r = model.create_embedding(input_text)
@@ -130,7 +139,7 @@ def test_get_cache_status():
 
 
 def test_from_local_uri():
-    from ..core import cache_from_uri
+    from ...utils import cache_from_uri
     from ..custom import CustomEmbeddingModelSpec
 
     tmp_dir = tempfile.mkdtemp()
@@ -153,7 +162,7 @@ def test_from_local_uri():
 
 def test_register_custom_embedding():
     from ....constants import XINFERENCE_CACHE_DIR
-    from ..core import cache_from_uri
+    from ...utils import cache_from_uri
     from ..custom import (
         CustomEmbeddingModelSpec,
         register_embedding,
@@ -188,7 +197,8 @@ def test_register_custom_embedding():
         model_id="test/custom_test_b",
         model_uri="file:///c/d",
     )
-    register_embedding(model_spec, False)
+    with pytest.raises(ValueError):
+        register_embedding(model_spec, False)
 
     # name conflict
     model_spec = CustomEmbeddingModelSpec(
@@ -210,3 +220,47 @@ def test_register_custom_embedding():
         unregister_embedding("custom_test_d")
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_register_fault_embedding():
+    from ....constants import XINFERENCE_MODEL_DIR
+    from .. import _install
+
+    os.makedirs(os.path.join(XINFERENCE_MODEL_DIR, "embedding"), exist_ok=True)
+    file_path = os.path.join(XINFERENCE_MODEL_DIR, "embedding/GTE.json")
+    data = {
+        "model_name": "GTE",
+        "model_id": None,
+        "model_revision": None,
+        "model_hub": "huggingface",
+        "dimensions": 768,
+        "max_tokens": 512,
+        "language": ["en", "zh"],
+        "model_uri": "/new_data/cache/gte-Qwen2",
+    }
+
+    with open(file_path, "w") as f:
+        json.dump(data, f, indent=4)
+
+    with pytest.warns(UserWarning) as record:
+        _install()
+    assert any(
+        "Invalid model URI /new_data/cache/gte-Qwen2" in str(r.message) for r in record
+    )
+
+
+def test_convert_ids_to_tokens():
+    from ..core import EmbeddingModel
+
+    model_path = cache(TEST_MODEL_SPEC_FROM_MODELSCOPE)
+    model = EmbeddingModel("mock", model_path, TEST_MODEL_SPEC_FROM_MODELSCOPE)
+    model.load()
+
+    # test for ids to tokens
+    ids = [[8074, 8059, 8064, 8056], [144, 147, 160, 160, 158]]
+    tokens = model.convert_ids_to_tokens(ids)
+
+    assert isinstance(tokens, list)
+    assert tokens == [["ｘ", "ｉ", "ｎ", "ｆ"], ["b", "e", "r", "r", "p"]]
+
+    shutil.rmtree(model_path, ignore_errors=True)

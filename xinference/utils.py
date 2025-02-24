@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-
 
 def cuda_count():
+    import torch
+
     # even if install torch cpu, this interface would return 0.
     return torch.cuda.device_count()

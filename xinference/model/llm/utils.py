@@ -11,356 +11,248 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import base64
 import functools
 import json
 import logging
+import os
+import re
 import time
+import typing
 import uuid
-from typing import AsyncGenerator, Dict, Iterator, List, Optional
+from io import BytesIO
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    cast,
+)
 
-from xinference.model.llm.llm_family import PromptStyleV1
+import requests
+from PIL import Image
 
 from ...types import (
-    SPECIAL_TOOL_PROMPT,
     ChatCompletion,
+    ChatCompletionChoice,
     ChatCompletionChunk,
     ChatCompletionMessage,
     Completion,
+    CompletionChoice,
     CompletionChunk,
+    CompletionUsage,
 )
+from .llm_family import (
+    LlamaCppLLMSpecV1,
+    LLMFamilyV1,
+    LLMSpecV1,
+    _get_cache_dir,
+    get_cache_status,
+)
+from .reasoning_parsers.abs_reasoning_parsers import ReasoningParser
 
 logger = logging.getLogger(__name__)
 
 
+QWEN_TOOL_CALL_FAMILY = [
+    "qwen1.5-chat",
+    "qwen1.5-moe-chat",
+    "qwen2-instruct",
+    "qwen2-moe-instruct",
+    "qwen2.5-instruct",
+    "qwen2.5-coder-instruct",
+]
+
+GLM4_TOOL_CALL_FAMILY = [
+    "glm4-chat",
+    "glm4-chat-1m",
+]
+
+LLAMA3_TOOL_CALL_FAMILY = [
+    "llama-3.1-instruct",
+]
+
+DEEPSEEK_TOOL_CALL_FAMILY = [
+    "deepseek-r1-distill-qwen",
+    "deepseek-r1-distill-llama",
+]
+
+TOOL_CALL_FAMILY = (
+    QWEN_TOOL_CALL_FAMILY
+    + GLM4_TOOL_CALL_FAMILY
+    + LLAMA3_TOOL_CALL_FAMILY
+    + DEEPSEEK_TOOL_CALL_FAMILY
+)
+
+QWEN_TOOL_CALL_SYMBOLS = ["<tool_call>", "</tool_call>"]
+
+
 class ChatModelMixin:
     @staticmethod
-    def get_prompt(
-        prompt: str,
-        chat_history: List[ChatCompletionMessage],
-        prompt_style: PromptStyleV1,
-        tools: Optional[List[Dict]] = None,
+    @functools.lru_cache
+    def _compile_jinja_template(chat_template):
+        """
+        Copied from transformers source code.
+        """
+        try:
+            from jinja2.exceptions import TemplateError
+            from jinja2.sandbox import ImmutableSandboxedEnvironment
+        except ImportError:
+            raise ImportError("xinference requires jinja2 to be installed.")
+
+        def raise_exception(message):
+            raise TemplateError(message)
+
+        jinja_env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+        jinja_env.globals["raise_exception"] = raise_exception
+        return jinja_env.from_string(chat_template)
+
+    def _build_from_raw_template(
+        self, messages: List, chat_template: str, **kwargs
     ) -> str:
+        compiled_template = self._compile_jinja_template(chat_template)
+        rendered = compiled_template.render(
+            messages=messages, add_generation_prompt=True, **kwargs
+        )
+        return rendered
+
+    def get_full_context(
+        self,
+        messages: List,
+        chat_template: str,
+        tokenizer=None,
+        tokenize=False,
+        **kwargs,
+    ):
+        if "vision" not in self.model_family.model_ability:  # type: ignore
+            messages = self.convert_messages_with_content_list_to_str_conversion(
+                messages
+            )
+        if tokenizer is not None:
+            try:
+                full_context = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=tokenize,
+                    chat_template=chat_template,
+                    add_generation_prompt=True,
+                    **kwargs,
+                )
+                return full_context
+            except Exception as e:
+                logger.warning(
+                    f"tokenizer.apply_chat_template error. Maybe this is an old model: {e}"
+                )
+                return self._build_from_raw_template(messages, chat_template, **kwargs)
+        else:
+            # build from jinja
+            # Compilation function uses a cache to avoid recompiling the same template
+            return self._build_from_raw_template(messages, chat_template, **kwargs)
+
+    @staticmethod
+    def convert_messages_with_content_list_to_str_conversion(
+        messages: List[Dict],
+    ) -> List[Dict]:
+        """
+        Handles messages with content list conversion, in order to support Cline, see GH#2659 .
+        """
+        for message in messages:
+            texts = ""
+            msg_content = message.get("content")
+            if msg_content:
+                if isinstance(msg_content, str):
+                    texts = msg_content
+                elif isinstance(msg_content, list):
+                    texts = "\n".join(item.get("text", "") for item in msg_content)
+            if texts:
+                message["content"] = texts
+        return messages
+
+    @staticmethod
+    def get_specific_prompt(model_family: str, messages: List[ChatCompletionMessage]):
         """
         Inspired by FastChat. Format chat history into a prompt according to the prompty style of
         different models.
         """
-        assert prompt_style.roles is not None
-        if prompt != SPECIAL_TOOL_PROMPT:
-            chat_history.append(
-                ChatCompletionMessage(role=prompt_style.roles[0], content=prompt)
-            )
-        chat_history.append(
-            ChatCompletionMessage(role=prompt_style.roles[1], content="")
-        )
+        _messages = [x for x in messages]  # copy for not modifying the origin messages
+        _messages.append({"role": "assistant", "content": ""})
 
-        if prompt_style.style_name == "ADD_COLON_SINGLE":
-            ret = prompt_style.system_prompt + prompt_style.intra_message_sep
-            for message in chat_history:
-                role = message["role"]
-                content = message["content"]
-                if content:
-                    ret += role + ": " + content + prompt_style.intra_message_sep
-                else:
-                    ret += role + ":"
-            return ret
-        elif prompt_style.style_name == "ADD_COLON_TWO":
-            seps = [prompt_style.intra_message_sep, prompt_style.inter_message_sep]
-            ret = prompt_style.system_prompt + seps[0]
-            for i, message in enumerate(chat_history):
-                role = message["role"]
-                content = message["content"]
-                if content:
-                    ret += role + ": " + content + seps[i % 2]
-                else:
-                    ret += role + ":"
-            return ret
-        elif prompt_style.style_name == "NO_COLON_TWO":
-            seps = [prompt_style.intra_message_sep, prompt_style.inter_message_sep]
-            ret = prompt_style.system_prompt
-            for i, message in enumerate(chat_history):
-                role = message["role"]
-                content = message["content"]
-                if content:
-                    ret += role + content + seps[i % 2]
-                else:
-                    ret += role
-            return ret
-        elif prompt_style.style_name == "LLAMA2":
-            seps = [prompt_style.intra_message_sep, prompt_style.inter_message_sep]
-            ret = ""
-            for i, message in enumerate(chat_history):
-                role = message["role"]
-                content = message["content"]
-                if content:
-                    if i == 0:
-                        ret += prompt_style.system_prompt + content
-                    else:
-                        ret += role + " " + content + seps[i % 2]
-                else:
-                    ret += role
-            return ret
-        elif prompt_style.style_name == "FALCON":
-            ret = prompt_style.system_prompt
-            for message in chat_history:
-                role = message["role"]
-                content = message["content"]
-                if content:
-                    ret += (
-                        role
-                        + ": "
-                        + content.replace("\r\n", "\n").replace("\n\n", "\n")
-                    )
-                    ret += "\n\n"
-                else:
-                    ret += role + ":"
-            return ret
-        elif prompt_style.style_name == "MIXTRAL_V01":
-            ret = ""
-            for i, message in enumerate(chat_history):
-                content = message["content"]
-                if i % 2 == 0:  # user
-                    ret += f"<s> [INST] {content} [/INST]"
-                else:  # assistant
-                    ret += f"{content} </s>"
-            return ret
-        elif prompt_style.style_name == "CHATGLM":
-            round_add_n = 1 if prompt_style.intra_message_sep == "\n\n" else 0
-            if prompt_style.system_prompt:
-                ret = prompt_style.system_prompt + prompt_style.intra_message_sep
-            else:
-                ret = ""
-            for i, message in enumerate(chat_history):
-                role = message["role"]
-                content = message["content"]
-                if i % 2 == 0:
-                    ret += f"[Round {i // 2 + round_add_n}]{prompt_style.intra_message_sep}"
-                if content:
-                    ret += role + "：" + content + prompt_style.intra_message_sep
-                else:
-                    ret += role + "："
-            return ret
-        elif prompt_style.style_name == "CHATGLM3":
-            prompts = (
-                [f"<|system|>\n{prompt_style.system_prompt}"]
-                if prompt_style.system_prompt
-                else []
+        if model_family == "internvl2":
+            system_prompt = (
+                messages[0]["content"] if messages[0]["role"] == "system" else ""
             )
-
-            for i, message in enumerate(chat_history):
-                role = message["role"]
-                content = message["content"]
-                tool_calls = message.get("tool_calls")
-                if tool_calls:
-                    content = tool_calls[0]["function"]
-                if content:
-                    if role == "tool":
-                        role = "observation"
-                    prompts.append(f"<|{role}|>\n{content}")
-                else:
-                    prompts.append(f"<|{role}|>")
-            return "\n".join(prompts)
-        elif prompt_style.style_name == "XVERSE":
+            intra_message_sep = "<|im_end|>"
             ret = (
-                f"<|system|> \n {prompt_style.system_prompt}"
-                if prompt_style.system_prompt
-                else ""
+                "<s>"
+                if system_prompt == ""
+                else "<s><|im_start|>system\n"  # type: ignore
+                + system_prompt
+                + intra_message_sep
+                + "\n"
             )
-            for i, message in enumerate(chat_history):
-                role = message["role"]
+            images = []  # type: ignore
+            for message in _messages:
+                role = "<|im_start|>" + message["role"]
                 content = message["content"]
-                if content:
-                    ret += f"<|{role}|> \n {content}"
-                else:
-                    ret += f"<|{role}|>"
-            return ret
-        elif prompt_style.style_name == "QWEN":
-            if tools:
-                tool_desc = """{name_for_model}: Call this tool to interact with the {name_for_human} API. What is the {name_for_human} API useful for? {description_for_model} Parameters: {parameters} Format the arguments as a JSON object."""
+                if isinstance(content, str):
+                    if content:
+                        ret += role + "\n" + content + intra_message_sep + "\n"
+                    else:
+                        ret += role + "\n"
+                elif isinstance(content, list):
+                    text = ""
+                    image_urls = []
+                    for c in content:
+                        c_type = c.get("type")
+                        if c_type == "text":
+                            text = c["text"]
+                        elif c_type == "image_url":
+                            image_urls.append(c["image_url"]["url"])
+                    image_futures = []
+                    from concurrent.futures import ThreadPoolExecutor
 
-                react_instruction = """Answer the following questions as best you can. You have access to the following APIs:
-
-{tools_text}
-
-Use the following format:
-
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tools_name_text}]
-Action Input: the input to the action
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can be repeated zero or more times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
-
-Begin!"""
-                tools_text = []
-                tools_name_text = []
-                for func_info in tools:
-                    parameters = []
-                    required_parameters = func_info["function"]["parameters"].get(
-                        "required", []
-                    )
-                    for name, p in func_info["function"]["parameters"][
-                        "properties"
-                    ].items():
-                        param = dict({"name": name}, **p)
-                        if name in required_parameters:
-                            param["required"] = True
-                        parameters.append(param)
-
-                    name = func_info["function"]["name"]
-                    desc = func_info["function"]["description"]
-                    tool_string = tool_desc.format(
-                        name_for_model=name,
-                        name_for_human=name,
-                        # Hint: You can add the following format requirements in description:
-                        #   "Format the arguments as a JSON object."
-                        #   "Enclose the code within triple backticks (`) at the beginning and end of the code."
-                        description_for_model=desc,
-                        parameters=json.dumps(parameters, ensure_ascii=False),
-                    )
-                    tools_text.append(tool_string)
-                    tools_name_text.append(name)
-                tools_text_string = "\n\n".join(tools_text)
-                tools_name_text_string = ", ".join(tools_name_text)
-                tool_system = react_instruction.format(
-                    tools_text=tools_text_string,
-                    tools_name_text=tools_name_text_string,
-                )
-            else:
-                tool_system = ""
-
-            ret = f"<|im_start|>system\n{prompt_style.system_prompt}<|im_end|>"
-            for message in chat_history:
-                role = message["role"]
-                content = message["content"]
-
-                ret += prompt_style.intra_message_sep
-                if tools:
-                    if role == "user":
-                        if tool_system:
-                            content = tool_system + f"\n\nQuestion: {content}"
-                            tool_system = ""
-                        else:
-                            content = f"Question: {content}"
-                    elif role == "assistant":
-                        tool_calls = message.get("tool_calls")
-                        if tool_calls:
-                            func_call = tool_calls[0]["function"]
-                            f_name, f_args = (
-                                func_call["name"],
-                                func_call["arguments"],
+                    with ThreadPoolExecutor() as executor:
+                        for image_url in image_urls:
+                            fut = executor.submit(_decode_image, image_url)
+                            image_futures.append(fut)
+                    images.extend([fut.result() for fut in image_futures])
+                    if len(image_futures) == 0:
+                        ret += role + "\n" + text + intra_message_sep + "\n"
+                    else:
+                        placeholders = "\n".join(
+                            f"Image-{i+1}: <image>\n"
+                            for i in range(
+                                len(images) - len(image_futures), len(images)
                             )
-                            content = f"Thought: I can use {f_name}.\nAction: {f_name}\nAction Input: {f_args}"
-                        elif content:
-                            content = f"Thought: I now know the final answer.\nFinal answer: {content}"
-                    elif role == "tool":
-                        role = "function"
-                        content = f"Observation: {content}"
-                    else:
-                        raise Exception(f"Unsupported message role: {role}")
-                if content:
-                    content = content.lstrip("\n").rstrip()
-                    ret += f"<|im_start|>{role}\n{content}<|im_end|>"
-                else:
-                    ret += f"<|im_start|>{role}\n"
-            return ret
-        elif prompt_style.style_name == "CHATML":
-            ret = (
-                ""
-                if prompt_style.system_prompt == ""
-                else prompt_style.system_prompt + prompt_style.intra_message_sep + "\n"
-            )
-            for message in chat_history:
-                role = message["role"]
-                content = message["content"]
-
-                if content:
-                    ret += role + "\n" + content + prompt_style.intra_message_sep + "\n"
-                else:
-                    ret += role + "\n"
-            return ret
-        elif prompt_style.style_name == "INTERNLM":
-            seps = [prompt_style.intra_message_sep, prompt_style.inter_message_sep]
-            ret = ""
-            for i, message in enumerate(chat_history[:-2]):
-                if i % 2 == 0:
-                    ret += "<s>"
-                role = message["role"]
-                content = message["content"]
-                ret += role + ":" + str(content) + seps[i % 2]
-            if len(ret) == 0:
-                ret += "<s>"
-            ret += (
-                chat_history[-2]["role"]
-                + ":"
-                + str(chat_history[-2]["content"])
-                + seps[0]
-            )
-            ret += chat_history[-1]["role"] + ":"
-            return ret
-        elif prompt_style.style_name == "ADD_COLON_SINGLE_COT":
-            ret = prompt_style.system_prompt + prompt_style.intra_message_sep
-            for message in chat_history:
-                role = message["role"]
-                content = message["content"]
-                if content:
-                    ret += role + ": " + content + prompt_style.intra_message_sep
-                else:
-                    ret += role + ": Let's think step by step."
-            return ret
-        elif prompt_style.style_name == "INSTRUCTION":
-            message = chat_history[-2]
-            return prompt_style.system_prompt.format(message["content"])
-        elif prompt_style.style_name == "DEEPSEEK_CHAT":
-            seps = [prompt_style.intra_message_sep, prompt_style.inter_message_sep]
-            ret = prompt_style.system_prompt
-            for i, message in enumerate(chat_history):
-                role = message["role"]
-                content = message["content"]
-                if content:
-                    ret += role + ": " + content + seps[i % 2]
-                else:
-                    ret += role + ":"
-            return ret
-        elif prompt_style.style_name == "DEEPSEEK_CODER":
-            sep = prompt_style.inter_message_sep
-            ret = prompt_style.system_prompt + sep
-            for i, message in enumerate(chat_history):
-                role = message["role"]
-                content = message["content"]
-                if content:
-                    ret += role + "\n" + content + sep
-                else:
-                    ret += role + "\n"
-            return ret
-        elif prompt_style.style_name == "GORILLA_OPENFUNCTIONS":
-            if tools:
-                gorilla_functions = []
-                for tool in tools:
-                    gorilla_functions.append(
-                        {
-                            "name": tool["function"]["name"],
-                            "api_name": tool["function"]["name"],
-                            "description": tool["function"]["description"],
-                            "parameters": [
-                                dict({"name": name}, **p)
-                                for name, p in tool["function"]["parameters"][
-                                    "properties"
-                                ].items()
-                            ],
-                        }
-                    )
-                tools_string = json.dumps(gorilla_functions)
-                return f"USER: <<question>> {prompt} <<function>> {tools_string}\nASSISTANT: "
-            else:
-                return f"USER: <<question>> {prompt}\nASSISTANT: "
+                        )
+                        ret += (
+                            role
+                            + "\n"
+                            + f"{placeholders}\n{text}"
+                            + intra_message_sep
+                            + "\n"
+                        )
+            if len(images) == 1:
+                ret = ret.replace("Image-1: <image>\n", "<image>\n")
+            return ret, images
         else:
-            raise ValueError(f"Invalid prompt style: {prompt_style.style_name}")
+            raise ValueError(f"Invalid model family: {model_family}")
 
     @classmethod
     def _to_chat_completion_chunk(cls, chunk: CompletionChunk) -> ChatCompletionChunk:
-        return {
+        choices = chunk.get("choices")
+        if (
+            chunk.get("object") == "chat.completion.chunk"
+            and choices
+            and "delta" in choices[0]
+        ):
+            # Already a ChatCompletionChunk, we don't need to convert chunk.
+            return cast(ChatCompletionChunk, chunk)
+        chat_chunk = {
             "id": "chat" + chunk["id"],
             "model": chunk["model"],
             "created": chunk["created"],
@@ -369,19 +261,29 @@ Begin!"""
                 {
                     "index": i,
                     "delta": {
-                        "content": choice["text"],
+                        **(
+                            {"content": choice["text"]}
+                            if ("text" in choice and choice["finish_reason"] is None)
+                            else {}
+                        ),
+                        **(
+                            {"tool_calls": choice["tool_calls"]}
+                            if "tool_calls" in choice
+                            else {}
+                        ),
                     },
                     "finish_reason": choice["finish_reason"],
                 }
                 for i, choice in enumerate(chunk["choices"])
             ],
         }
+        return cast(ChatCompletionChunk, chat_chunk)
 
     @classmethod
     def _get_first_chat_completion_chunk(
         cls, chunk: CompletionChunk
     ) -> ChatCompletionChunk:
-        return {
+        chat_chunk = {
             "id": "chat" + chunk["id"],
             "model": chunk["model"],
             "created": chunk["created"],
@@ -391,141 +293,364 @@ Begin!"""
                     "index": i,
                     "delta": {
                         "role": "assistant",
+                        "content": "",
                     },
                     "finish_reason": None,
                 }
                 for i, choice in enumerate(chunk["choices"])
             ],
         }
+        return cast(ChatCompletionChunk, chat_chunk)
+
+    @classmethod
+    def _get_final_chat_completion_chunk(
+        cls, chunk: CompletionChunk
+    ) -> ChatCompletionChunk:
+        chat_chunk = {
+            "id": "chat" + chunk["id"],
+            "model": chunk["model"],
+            "created": chunk["created"],
+            "object": "chat.completion.chunk",
+            "choices": [],
+        }
+        usage = chunk.get("usage")
+        if usage is not None:
+            chat_chunk["usage"] = usage
+        return cast(ChatCompletionChunk, chat_chunk)
 
     @classmethod
     def _to_chat_completion_chunks(
         cls,
         chunks: Iterator[CompletionChunk],
+        reasoning_parse: Optional[ReasoningParser] = None,
     ) -> Iterator[ChatCompletionChunk]:
         for i, chunk in enumerate(chunks):
             if i == 0:
                 yield cls._get_first_chat_completion_chunk(chunk)
-            yield cls._to_chat_completion_chunk(chunk)
+            # usage
+            choices = chunk.get("choices")
+            if not choices:
+                yield cls._get_final_chat_completion_chunk(chunk)
+            else:
+                yield cls._to_chat_completion_chunk(chunk)
+
+    @classmethod
+    def _tools_to_messages_for_deepseek(
+        cls, messages: List[dict], tools: Iterable[dict]
+    ):
+        # deepseek integrates tool calls into messages
+        # we follow the chat template rule to integrate tools into messages
+        tool_call_message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [],
+        }
+
+        for tool in tools:
+            function_name = tool["function"]["name"]
+            parameters = tool["function"].get("parameters", {}).get("properties", {})
+            function_args_json = json.dumps(parameters)
+
+            tool_call_message["tool_calls"].append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": function_name,
+                        "arguments": function_args_json,
+                    },
+                }
+            )
+
+        messages.append(tool_call_message)
 
     @classmethod
     async def _async_to_chat_completion_chunks(
         cls,
         chunks: AsyncGenerator[CompletionChunk, None],
+        reasoning_parser: Optional[ReasoningParser] = None,
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
         i = 0
+        previous_text = ""
+        current_text = ""
         async for chunk in chunks:
             if i == 0:
-                yield cls._get_first_chat_completion_chunk(chunk)
-            yield cls._to_chat_completion_chunk(chunk)
+                chat_chunk = cls._get_first_chat_completion_chunk(chunk)
+            elif not chunk.get("choices"):
+                # usage
+                chat_chunk = cls._get_final_chat_completion_chunk(chunk)
+            else:
+                chat_chunk = cls._to_chat_completion_chunk(chunk)
+            if reasoning_parser is not None:
+                choices = chat_chunk.get("choices")
+                if choices is None:
+                    continue
+                for choice in choices:
+                    delta = choice.get("delta")
+                    if not delta:
+                        continue
+                    current_text = previous_text + delta.get("content", "")
+                    choice[
+                        "delta"
+                    ] = reasoning_parser.extract_reasoning_content_streaming(
+                        previous_text=previous_text,
+                        current_text=current_text,
+                        delta=delta,
+                    )
+                    previous_text = current_text
+            yield chat_chunk
             i += 1
 
     @staticmethod
-    def _to_chat_completion(completion: Completion) -> ChatCompletion:
+    def _to_chat_completion(
+        completion: Completion, reasoning_parser: Optional[ReasoningParser] = None
+    ) -> ChatCompletion:
+        choices = []
+        for i, choice in enumerate(completion["choices"]):
+            content = choice["text"]
+            reasoning_content = None
+
+            if reasoning_parser is not None:
+                reasoning_content, content = reasoning_parser.extract_reasoning_content(  # type: ignore
+                    choice
+                )
+
+            message = {"role": "assistant", "content": content}
+
+            # add only reasoning_content is None
+            if reasoning_content is not None:
+                message["reasoning_content"] = reasoning_content
+
+            choices.append(
+                {
+                    "index": i,
+                    "message": message,
+                    "finish_reason": choice["finish_reason"],
+                }
+            )
         return {
             "id": "chat" + completion["id"],
             "object": "chat.completion",
             "created": completion["created"],
             "model": completion["model"],
-            "choices": [
-                {
-                    "index": i,
-                    "message": {
-                        "role": "assistant",
-                        "content": choice["text"],
-                    },
-                    "finish_reason": choice["finish_reason"],
-                }
-                for i, choice in enumerate(completion["choices"])
-            ],
+            "choices": choices,  # type: ignore
             "usage": completion["usage"],
         }
 
     @staticmethod
-    def _eval_gorilla_openfunctions_arguments(c, tools):
-        tool_names = [tool["function"]["name"] for tool in tools]
-        arguments = c["choices"][0]["text"]
-
-        def tool_call(n, **kwargs):
-            return None, n, kwargs
-
+    def _eval_glm_chat_arguments(c) -> List[Tuple]:
+        """
+        Currently, glm4 tool call only supports one function
+        """
         try:
-            a, b, c = eval(
-                arguments, {n: functools.partial(tool_call, n) for n in tool_names}
-            )
-            return a, b, c
-        except Exception as e:
-            logger.error("Eval tool calls completion failed: %s", e)
-            return arguments, None, None
-
-    @staticmethod
-    def _eval_chatglm3_arguments(c, tools):
-        if isinstance(c[0], str):
-            return c[0], None, None
-        return None, c[0]["name"], c[0]["parameters"]
-
-    @staticmethod
-    def _eval_qwen_chat_arguments(c, tools):
-        text = c["choices"][0]["text"]
-        try:
-            # Refer to:
-            # https://github.com/QwenLM/Qwen/blob/main/examples/react_prompt.md
-            # https://github.com/QwenLM/Qwen/blob/main/openai_api.py#L297
-            func_name, func_args = "", ""
-            i = text.rfind("\nAction:")
-            j = text.rfind("\nAction Input:")
-            k = text.rfind("\nObservation:")
-            if 0 <= i < j:  # If the text has `Action` and `Action input`,
-                if k < j:  # but does not contain `Observation`,
-                    # then it is likely that `Observation` is omitted by the LLM,
-                    # because the output text may have discarded the stop word.
-                    text = text.rstrip() + "\nObservation:"  # Add it back.
-                    k = text.rfind("\nObservation:")
-            if 0 <= i < j < k:
-                func_name = text[i + len("\nAction:") : j].strip()
-                func_args = text[j + len("\nAction Input:") : k].strip()
-            if func_name:
-                return None, func_name, json.loads(func_args)
-            z = text.rfind("\nFinal Answer: ")
-            if z >= 0:
-                text = text[z + len("\nFinal Answer: ") :]
-        except Exception as e:
-            logger.error("Eval tool calls completion failed: %s", e)
-        return text, None, None
+            if isinstance(c, dict):
+                try:
+                    return [(None, c["name"], json.loads(c["arguments"]))]
+                except Exception:
+                    return [(None, c["name"], c["arguments"])]
+        except KeyError:
+            logger.error("Can't parse glm output: %s", c)
+            return [(str(c), None, None)]
+        else:
+            return [(str(c), None, None)]
 
     @classmethod
-    def _tool_calls_completion(cls, model_name, model_uid, c, tools):
-        _id = str(uuid.uuid4())
-        if model_name == "gorilla-openfunctions-v1":
-            content, func, args = cls._eval_gorilla_openfunctions_arguments(c, tools)
-        elif model_name == "chatglm3":
-            content, func, args = cls._eval_chatglm3_arguments(c, tools)
-        elif model_name == "qwen-chat":
-            content, func, args = cls._eval_qwen_chat_arguments(c, tools)
-        else:
-            raise Exception(f"Model {model_name} is not support tool calls.")
-        logger.debug("Tool call content: %s, func: %s, args: %s", content, func, args)
+    def _handle_qwen_tool_result(cls, text: str) -> List[Tuple]:
+        text: str = text.strip()  # type: ignore
+        contents: List[str] = text.split(QWEN_TOOL_CALL_SYMBOLS[1])
+        results: List[Tuple] = []
+        for content in contents:
+            content = content.strip()
+            if content:
+                pos = content.find(QWEN_TOOL_CALL_SYMBOLS[0])
+                if pos != -1:
+                    content = content[pos + len(QWEN_TOOL_CALL_SYMBOLS[0]) :]
+                content = content.strip()
+                try:
+                    res = json.loads(content)
+                    results.append((None, res["name"], res["arguments"]))
+                except Exception as e:
+                    logger.error(
+                        "Can't parse single qwen tool call output: %s. Error: %s",
+                        content,
+                        e,
+                    )
+                    results.append((content, None, None))
+        return results
 
-        if content:
-            m = {"role": "assistant", "content": content, "tool_calls": []}
-            finish_reason = "stop"
+    @classmethod
+    def _eval_qwen_chat_arguments(cls, c) -> List[Tuple]:
+        text = c["choices"][0]["text"]
+        return cls._handle_qwen_tool_result(text)
+
+    @classmethod
+    def _eval_llama3_chat_arguments(cls, c) -> List[Tuple]:
+        text = c["choices"][0]["text"]
+        try:
+            data = eval(text, {}, {})
+            return [(None, data["name"], data["parameters"])]
+        except Exception:
+            return [(text, None, None)]
+
+    @classmethod
+    def _eval_deepseek_chat_arguments(cls, c) -> List[Tuple]:
+        """
+        Parses tool calls from deepseek-r1 format and removes duplicates.
+
+        Returns:
+        List[Tuple[Optional[str], Optional[str], Optional[dict]]]
+        - (None, function_name, arguments) if successfully parsed.
+        - (content, None, None) if parsing failed (content is raw JSON text).
+
+        Example input:
+        <｜tool▁call｜>get_current_weather
+        ```json
+        {"location": "tokyo", "unit": "fahrenheit"}
+        ```
+
+        Output:
+        [
+            (None, "get_current_weather", {"location": "tokyo", "unit": "fahrenheit"})
+        ]
+        """
+
+        text = c["choices"][0]["text"]
+
+        pattern = r"<｜tool▁call｜>(\w+)\s*```json\s*(.*?)\s*```"
+        matches = re.findall(pattern, text, re.DOTALL)
+
+        if not matches:
+            return [(text, None, None)]
+
+        tool_calls = set()  # Used for deduplication
+        results = []
+
+        for function_name, args_json in matches:
+            try:
+                arguments = json.loads(args_json)
+                # Convert dictionary to frozenset for deduplication
+                arguments_hashable = frozenset(arguments.items())
+                tool_call_tuple = (None, function_name, arguments)
+            except json.JSONDecodeError:
+                tool_call_tuple = (
+                    args_json,
+                    None,
+                    None,
+                )  # If parsing fails, treat as raw content
+                arguments_hashable = None  # No need for hashing
+
+            # Avoid duplicate entries
+            dedup_key = (function_name, arguments_hashable)
+            if dedup_key not in tool_calls:
+                tool_calls.add(dedup_key)
+                results.append(tool_call_tuple)
+
+        return results
+
+    @classmethod
+    def _eval_tool_arguments(cls, model_family, c):
+        family = model_family.model_family or model_family.model_name
+        if family in GLM4_TOOL_CALL_FAMILY:
+            result = cls._eval_glm_chat_arguments(c)
+        elif family in QWEN_TOOL_CALL_FAMILY:
+            result = cls._eval_qwen_chat_arguments(c)
+        elif family in LLAMA3_TOOL_CALL_FAMILY:
+            result = cls._eval_llama3_chat_arguments(c)
+        elif family in DEEPSEEK_TOOL_CALL_FAMILY:
+            result = cls._eval_deepseek_chat_arguments(c)
         else:
-            m = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
+            raise Exception(
+                f"Model {model_family.model_name} is not support tool calls."
+            )
+        logger.debug(f"Tool call content: {result}")
+        return result
+
+    @classmethod
+    def _tool_calls_completion_chunk(cls, model_family, model_uid, c, chunk_id=None):
+        _id = chunk_id if chunk_id is not None else str(uuid.uuid4())
+        tool_result = cls._eval_tool_arguments(model_family, c)
+        tool_calls = []
+        failed_contents = []
+        for content, func, args in tool_result:
+            if func:
+                tool_calls.append(
                     {
                         "id": f"call_{_id}",
                         "type": "function",
                         "function": {
                             "name": func,
-                            "arguments": json.dumps(args),
+                            "arguments": json.dumps(args, ensure_ascii=False),
                         },
                     }
-                ],
+                )
+            else:
+                failed_contents.append(content)
+        finish_reason = "tool_calls" if tool_calls else "stop"
+        d = {
+            "role": "assistant",
+            "content": ". ".join(failed_contents) if failed_contents else None,
+            "tool_calls": tool_calls,
+        }
+        try:
+            usage = c.get("usage")
+            assert "prompt_tokens" in usage
+        except Exception:
+            usage = {
+                "prompt_tokens": -1,
+                "completion_tokens": -1,
+                "total_tokens": -1,
             }
-            finish_reason = "tool_calls"
+        return {
+            "id": "chat" + f"cmpl-{_id}",
+            "model": model_uid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": d,
+                    "logprobs": None,
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": usage,
+        }
 
+    @classmethod
+    def _tool_calls_completion(cls, model_family, model_uid, c):
+        _id = str(uuid.uuid4())
+        tool_result = cls._eval_tool_arguments(model_family, c)
+
+        tool_calls = []
+        failed_contents = []
+        for content, func, args in tool_result:
+            if func:
+                tool_calls.append(
+                    {
+                        "id": f"call_{_id}",
+                        "type": "function",
+                        "function": {
+                            "name": func,
+                            "arguments": json.dumps(args, ensure_ascii=False),
+                        },
+                    }
+                )
+            else:
+                failed_contents.append(content)
+        finish_reason = "tool_calls" if tool_calls else "stop"
+        m = {
+            "role": "assistant",
+            "content": ". ".join(failed_contents) if failed_contents else None,
+            "tool_calls": tool_calls,
+        }
+        try:
+            usage = c.get("usage")
+            assert "prompt_tokens" in usage
+        except Exception:
+            usage = {
+                "prompt_tokens": -1,
+                "completion_tokens": -1,
+                "total_tokens": -1,
+            }
         return {
             "id": "chat" + f"cmpl-{_id}",
             "model": model_uid,
@@ -538,9 +663,222 @@ Begin!"""
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": -1,
-                "completion_tokens": -1,
-                "total_tokens": -1,
-            },
+            "usage": usage,
         }
+
+    def _transform_messages(
+        self,
+        messages: List[ChatCompletionMessage],
+    ):
+        transformed_messages = []
+        for msg in messages:
+            new_content = []
+            role = msg["role"]
+            content = msg["content"]
+            if isinstance(content, str):
+                new_content.append({"type": "text", "text": content})
+            elif isinstance(content, List):
+                for item in content:  # type: ignore
+                    if "text" in item:
+                        new_content.append({"type": "text", "text": item["text"]})
+                    elif "image_url" in item:
+                        new_content.append(
+                            {"type": "image", "image": item["image_url"]["url"]}
+                        )
+                    elif "video_url" in item:
+                        new_content.append(
+                            {"type": "video", "video": item["video_url"]["url"]}
+                        )
+            new_message = {"role": role, "content": new_content}
+            transformed_messages.append(new_message)
+
+        return transformed_messages
+
+
+def get_file_location(
+    llm_family: LLMFamilyV1, spec: LLMSpecV1, quantization: str
+) -> Tuple[str, bool]:
+    cache_dir = _get_cache_dir(
+        llm_family, spec, quantization, create_if_not_exist=False
+    )
+    cache_status = get_cache_status(llm_family, spec, quantization)
+    if isinstance(cache_status, list):
+        is_cached = None
+        for q, cs in zip(spec.quantizations, cache_status):
+            if q == quantization:
+                is_cached = cs
+                break
+    else:
+        is_cached = cache_status
+    assert isinstance(is_cached, bool)
+
+    if spec.model_format in ["pytorch", "gptq", "awq", "fp8", "mlx"]:
+        return cache_dir, is_cached
+    elif spec.model_format in ["ggufv2"]:
+        assert isinstance(spec, LlamaCppLLMSpecV1)
+        filename = spec.model_file_name_template.format(quantization=quantization)
+        model_path = os.path.join(cache_dir, filename)
+        return model_path, is_cached
+    else:
+        raise ValueError(f"Not supported model format {spec.model_format}")
+
+
+def get_model_version(
+    llm_family: LLMFamilyV1, llm_spec: LLMSpecV1, quantization: str
+) -> str:
+    return f"{llm_family.model_name}--{llm_spec.model_size_in_billions}B--{llm_spec.model_format}--{quantization}"
+
+
+def _decode_image(_url):
+    if _url.startswith("data:"):
+        logging.info("Parse url by base64 decoder.")
+        # https://platform.openai.com/docs/guides/vision/uploading-base-64-encoded-images
+        # e.g. f"data:image/jpeg;base64,{base64_image}"
+        _type, data = _url.split(";")
+        _, ext = _type.split("/")
+        data = data[len("base64,") :]
+        data = base64.b64decode(data.encode("utf-8"))
+        return Image.open(BytesIO(data)).convert("RGB")
+    else:
+        try:
+            response = requests.get(_url)
+        except requests.exceptions.MissingSchema:
+            return Image.open(_url).convert("RGB")
+        else:
+            return Image.open(BytesIO(response.content)).convert("RGB")
+
+
+def _decode_image_without_rgb(_url):
+    if _url.startswith("data:"):
+        logging.info("Parse url by base64 decoder.")
+        # https://platform.openai.com/docs/guides/vision/uploading-base-64-encoded-images
+        # e.g. f"data:image/jpeg;base64,{base64_image}"
+        _type, data = _url.split(";")
+        _, ext = _type.split("/")
+        data = data[len("base64,") :]
+        data = base64.b64decode(data.encode("utf-8"))
+        return Image.open(BytesIO(data))
+    else:
+        try:
+            response = requests.get(_url)
+        except requests.exceptions.MissingSchema:
+            return Image.open(_url)
+        else:
+            return Image.open(BytesIO(response.content))
+
+
+@typing.no_type_check
+def generate_completion_chunk(
+    chunk_text: Optional[str],
+    finish_reason: Optional[str],
+    chunk_id: str,
+    model_uid: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+    has_choice: bool = True,
+    has_content: bool = True,
+):
+    choices = []
+    if has_choice:
+        choices.append(
+            CompletionChoice(
+                text=chunk_text, index=0, logprobs=None, finish_reason=finish_reason
+            )
+            if has_content
+            else CompletionChoice(index=0, logprobs=None, finish_reason=finish_reason)
+        )
+    return CompletionChunk(
+        id=chunk_id,
+        object="text_completion",
+        created=int(time.time()),
+        model=model_uid,
+        choices=choices,
+        usage=CompletionUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        ),
+    )
+
+
+def generate_completion(
+    model_uid: str,
+    response: str,
+    prompt_tokens=-1,
+    completion_tokens=-1,
+    total_tokens=-1,
+    finish_reason="stop",
+) -> Completion:
+    return Completion(
+        id=str(uuid.uuid1()),
+        object="text_completion",
+        created=int(time.time()),
+        model=model_uid,
+        choices=[
+            CompletionChoice(
+                text=response, index=0, logprobs=None, finish_reason=finish_reason
+            )
+        ],
+        usage=CompletionUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        ),
+    )
+
+
+def generate_chat_completion(
+    model_uid: str,
+    response: str,
+    prompt_tokens=-1,
+    completion_tokens=-1,
+    total_tokens=-1,
+    finish_reason="stop",
+) -> ChatCompletion:
+    return ChatCompletion(
+        id="chat" + str(uuid.uuid1()),
+        object="chat.completion",
+        created=int(time.time()),
+        model=model_uid,
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message={"role": "assistant", "content": response},
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=CompletionUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        ),
+    )
+
+
+@functools.lru_cache
+def get_stop_token_ids_from_config_file(model_path: str) -> Optional[List[int]]:
+    from transformers import GenerationConfig as TransformersGenerationConfig
+
+    transformers_config = TransformersGenerationConfig.from_pretrained(model_path)
+    if transformers_config.eos_token_id is not None:
+        stop_token_ids = (
+            transformers_config.eos_token_id
+            if isinstance(transformers_config.eos_token_id, list)
+            else [transformers_config.eos_token_id]
+        )
+        return stop_token_ids
+    return None
+
+
+def parse_messages(messages: List[Dict]) -> Tuple:
+    """
+    Some older models still follow the old way of parameter passing.
+    This function helps to parse out the needed information from OpenAI-compatible `messages`.
+    """
+    system_messages = [mess["content"] for mess in messages if mess["role"] == "system"]
+    content_messages = [mess for mess in messages if mess["role"] != "system"]
+    prompt = content_messages[-1]["content"]
+    system_prompt = ". ".join(system_messages) if system_messages else None
+    chat_history = content_messages[:-1]
+    return prompt, system_prompt, chat_history

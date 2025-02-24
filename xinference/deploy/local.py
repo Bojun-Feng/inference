@@ -23,7 +23,7 @@ import xoscar as xo
 from xoscar.utils import get_next_port
 
 from ..constants import (
-    XINFERENCE_HEALTH_CHECK_ATTEMPTS,
+    XINFERENCE_HEALTH_CHECK_FAILURE_THRESHOLD,
     XINFERENCE_HEALTH_CHECK_INTERVAL,
 )
 from ..core.supervisor import SupervisorActor
@@ -35,11 +35,14 @@ logger = logging.getLogger(__name__)
 
 async def _start_local_cluster(
     address: str,
+    metrics_exporter_host: Optional[str] = None,
+    metrics_exporter_port: Optional[int] = None,
     logging_conf: Optional[Dict] = None,
 ):
     from .utils import create_worker_actor_pool
 
-    logging.config.dictConfig(logging_conf)  # type: ignore
+    if logging_conf:
+        logging.config.dictConfig(logging_conf)  # type: ignore
 
     pool = None
     try:
@@ -47,10 +50,14 @@ async def _start_local_cluster(
             address=address, logging_conf=logging_conf
         )
         await xo.create_actor(
-            SupervisorActor, address=address, uid=SupervisorActor.uid()
+            SupervisorActor, address=address, uid=SupervisorActor.default_uid()
         )
         await start_worker_components(
-            address=address, supervisor_address=address, main_pool=pool
+            address=address,
+            supervisor_address=address,
+            main_pool=pool,
+            metrics_exporter_host=metrics_exporter_host,
+            metrics_exporter_port=metrics_exporter_port,
         )
         await pool.join()
     except asyncio.CancelledError:
@@ -58,7 +65,12 @@ async def _start_local_cluster(
             await pool.stop()
 
 
-def run(address: str, logging_conf: Optional[Dict] = None):
+def run(
+    address: str,
+    metrics_exporter_host: Optional[str] = None,
+    metrics_exporter_port: Optional[int] = None,
+    logging_conf: Optional[Dict] = None,
+):
     def sigterm_handler(signum, frame):
         sys.exit(0)
 
@@ -66,26 +78,46 @@ def run(address: str, logging_conf: Optional[Dict] = None):
 
     loop = asyncio.get_event_loop()
     task = loop.create_task(
-        _start_local_cluster(address=address, logging_conf=logging_conf)
+        _start_local_cluster(
+            address=address,
+            metrics_exporter_host=metrics_exporter_host,
+            metrics_exporter_port=metrics_exporter_port,
+            logging_conf=logging_conf,
+        )
     )
     loop.run_until_complete(task)
 
 
 def run_in_subprocess(
-    address: str, logging_conf: Optional[Dict] = None
+    address: str,
+    metrics_exporter_host: Optional[str] = None,
+    metrics_exporter_port: Optional[int] = None,
+    logging_conf: Optional[Dict] = None,
 ) -> multiprocessing.Process:
-    p = multiprocessing.Process(target=run, args=(address, logging_conf))
+    p = multiprocessing.Process(
+        target=run,
+        args=(address, metrics_exporter_host, metrics_exporter_port, logging_conf),
+    )
     p.start()
     return p
 
 
-def main(host: str, port: int, logging_conf: Optional[Dict] = None):
+def main(
+    host: str,
+    port: int,
+    metrics_exporter_host: Optional[str] = None,
+    metrics_exporter_port: Optional[int] = None,
+    logging_conf: Optional[Dict] = None,
+    auth_config_file: Optional[str] = None,
+):
     supervisor_address = f"{host}:{get_next_port()}"
-    local_cluster = run_in_subprocess(supervisor_address, logging_conf)
+    local_cluster = run_in_subprocess(
+        supervisor_address, metrics_exporter_host, metrics_exporter_port, logging_conf
+    )
 
     if not health_check(
         address=supervisor_address,
-        max_attempts=XINFERENCE_HEALTH_CHECK_ATTEMPTS,
+        max_attempts=XINFERENCE_HEALTH_CHECK_FAILURE_THRESHOLD,
         sleep_interval=XINFERENCE_HEALTH_CHECK_INTERVAL,
     ):
         raise RuntimeError("Cluster is not available after multiple attempts")
@@ -98,6 +130,7 @@ def main(host: str, port: int, logging_conf: Optional[Dict] = None):
             host=host,
             port=port,
             logging_conf=logging_conf,
+            auth_config_file=auth_config_file,
         )
     finally:
-        local_cluster.terminate()
+        local_cluster.kill()

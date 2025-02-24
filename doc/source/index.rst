@@ -13,6 +13,7 @@ Welcome to Xinference!
    user_guide/index
    examples/index
    reference/index
+   development/index
 
 
 Xorbits Inference (Xinference) is an open-source platform to streamline the operation and integration
@@ -32,21 +33,15 @@ Developing Real-world AI Applications with Xinference
     client = Client("http://localhost:9997")
     model = client.get_model("MODEL_UID")
 
+    # Chat to LLM
     model.chat(
-       prompt="What is the largest animal?",
-       system_prompt="You are a helpful assistant",
+       messages=[{"role": "system", "content": "You are a helpful assistant"}, {"role": "user", "content": "What is the largest animal?"}],
        generate_config={"max_tokens": 1024}
     )
-
-  .. code-tab:: python Multimodal
-   
-    from xinference.client import Client
-
-    client = Client("http://localhost:9997")
-    model = client.get_model("MODEL_UID")
-
+    
+    # Chat to VL model
     model.chat(
-       chat_history=[
+       messages=[
          {
             "role": "user",
             "content": [
@@ -81,6 +76,15 @@ Developing Real-world AI Applications with Xinference
 
     model.text_to_image("An astronaut walking on the mars")
 
+  .. code-tab:: python Audio
+
+    from xinference.client import Client
+
+    client = Client("http://localhost:9997")
+    model = client.get_model("MODEL_UID")
+
+    with open("speech.mp3", "rb") as audio_file:
+        model.transcriptions(audio_file.read())
 
   .. code-tab:: python Rerank
 
@@ -98,6 +102,15 @@ Developing Real-world AI Applications with Xinference
       "A woman is playing violin."
     ]
     print(model.rerank(corpus, query))
+
+  .. code-tab:: python Video
+
+    from xinference.client import Client
+
+    client = Client("http://localhost:9997")
+    model = client.get_model("MODEL_UID")
+
+    model.text_to_video("")
 
 
 Getting Started
@@ -131,6 +144,70 @@ Getting Started
       :link-type: ref
       
       Register model weights and turn it into an API.
+
+
+
+Explore the API
+---------------
+
+.. grid:: 2
+
+    .. grid-item-card::  Chat & Generate
+      :link: chat
+      :link-type: ref
+
+      Learn how to chat with LLMs in Xinference.
+
+    .. grid-item-card::  Tools
+      :link: tools
+      :link-type: ref
+
+      Learn how to connect LLM with external tools.
+
+
+.. grid:: 2
+
+    .. grid-item-card::  Embeddings
+      :link: embed
+      :link-type: ref
+
+      Learn how to create text embeddings in Xinference.
+
+    .. grid-item-card::  Rerank
+      :link: rerank
+      :link-type: ref
+
+      Learn how to use rerank models in Xinference.
+
+
+.. grid:: 2
+
+    .. grid-item-card::  Images
+      :link: image
+      :link-type: ref
+
+      Learn how to generate images with Xinference.
+
+    .. grid-item-card::  Multimodal
+      :link: multimodal
+      :link-type: ref
+
+      Learn how to process images and audio with LLMs.
+
+
+.. grid:: 2
+
+   .. grid-item-card::  Audio
+      :link: audio
+      :link-type: ref
+
+      Learn how to turn audio into text or text into audio with Xinference.
+
+   .. grid-item-card::  Video
+      :link: video
+      :link-type: ref
+
+      Learn how to generate video with Xinference.
 
 
 Getting Involved
@@ -169,14 +246,14 @@ Getting Involved
          :gutter: 3
 
          .. grid-item-card:: 
-            :link: https://xorbits.cn/assets/images/wechat_pr.png
+            :link: https://xorbits.cn/assets/images/wechat_work_qr.png
             
             :fab:`weixin` Find community on WeChat
 
-         .. grid-item-card:: 
-            :link: https://join.slack.com/t/xorbitsio/shared_invite/zt-1o3z9ucdh-RbfhbPVpx7prOVdM1CAuxg
-            
-            :fab:`slack` Find community on Slack
+         .. grid-item-card::
+            :link: https://discord.gg/Xw9tszSkr5
+
+            :fab:`discord` Find community on Discord
 
          .. grid-item-card::  
             :link: https://github.com/xorbitsai/inference/issues/new/choose

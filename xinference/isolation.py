@@ -19,23 +19,54 @@ from typing import Any, Coroutine
 
 class Isolation:
     # TODO: better move isolation to xoscar.
-    def __init__(self, loop: asyncio.AbstractEventLoop, threaded: bool = True):
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        threaded: bool = True,
+        daemon: bool = True,
+    ):
         self._loop = loop
         self._threaded = threaded
 
         self._stopped = None
         self._thread = None
         self._thread_ident = None
+        self._daemon = daemon
 
     def _run(self):
         asyncio.set_event_loop(self._loop)
         self._stopped = asyncio.Event()
         self._loop.run_until_complete(self._stopped.wait())
+        self._cancel_all_tasks(self._loop)
+
+    @staticmethod
+    def _cancel_all_tasks(loop):
+        to_cancel = asyncio.all_tasks(loop)
+        if not to_cancel:
+            return
+
+        for task in to_cancel:
+            task.cancel()
+
+        loop.run_until_complete(asyncio.gather(*to_cancel, return_exceptions=True))
+
+        for task in to_cancel:
+            if task.cancelled():
+                continue
+            if task.exception() is not None:
+                loop.call_exception_handler(
+                    {
+                        "message": "unhandled exception during asyncio.run() shutdown",
+                        "exception": task.exception(),
+                        "task": task,
+                    }
+                )
 
     def start(self):
         if self._threaded:
             self._thread = thread = threading.Thread(target=self._run)
-            thread.daemon = True
+            if self._daemon:
+                thread.daemon = True
             thread.start()
             self._thread_ident = thread.ident
 

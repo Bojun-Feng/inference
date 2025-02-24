@@ -14,16 +14,25 @@
 import json
 import logging
 import os
+import random
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
-from fsspec import AbstractFileSystem
+import huggingface_hub
+import numpy as np
+import torch
 
-from ..constants import XINFERENCE_CACHE_DIR, XINFERENCE_ENV_MODEL_SRC
+from ..constants import (
+    XINFERENCE_CACHE_DIR,
+    XINFERENCE_DOWNLOAD_MAX_ATTEMPTS,
+    XINFERENCE_ENV_MODEL_SRC,
+)
+from ..device_utils import get_available_device, is_device_available
+from .core import CacheableModelSpec
 
 logger = logging.getLogger(__name__)
-MAX_ATTEMPTS = 3
+IS_NEW_HUGGINGFACE_HUB: bool = huggingface_hub.__version__ >= "0.23.0"
 
 
 def is_locale_chinese_simplified() -> bool:
@@ -37,12 +46,25 @@ def is_locale_chinese_simplified() -> bool:
 
 
 def download_from_modelscope() -> bool:
-    if os.environ.get(XINFERENCE_ENV_MODEL_SRC) == "modelscope":
-        return True
+    if os.environ.get(XINFERENCE_ENV_MODEL_SRC):
+        return os.environ.get(XINFERENCE_ENV_MODEL_SRC) == "modelscope"
     elif is_locale_chinese_simplified():
         return True
     else:
         return False
+
+
+def download_from_openmind_hub() -> bool:
+    if os.environ.get(XINFERENCE_ENV_MODEL_SRC):
+        return os.environ.get(XINFERENCE_ENV_MODEL_SRC) == "openmind_hub"
+    else:
+        return False
+
+
+def download_from_csghub() -> bool:
+    if os.environ.get(XINFERENCE_ENV_MODEL_SRC) == "csghub":
+        return True
+    return False
 
 
 def symlink_local_file(path: str, local_dir: str, relpath: str) -> str:
@@ -73,6 +95,13 @@ def symlink_local_file(path: str, local_dir: str, relpath: str) -> str:
     return local_dir_filepath
 
 
+def create_symlink(download_dir: str, cache_dir: str):
+    for subdir, dirs, files in os.walk(download_dir):
+        for file in files:
+            relpath = os.path.relpath(os.path.join(subdir, file), download_dir)
+            symlink_local_file(os.path.join(subdir, file), cache_dir, relpath)
+
+
 def retry_download(
     download_func: Callable,
     model_name: str,
@@ -81,11 +110,11 @@ def retry_download(
     **kwargs,
 ):
     last_ex = None
-    for current_attempt in range(1, MAX_ATTEMPTS + 1):
+    for current_attempt in range(1, XINFERENCE_DOWNLOAD_MAX_ATTEMPTS + 1):
         try:
             return download_func(*args, **kwargs)
         except Exception as e:
-            remaining_attempts = MAX_ATTEMPTS - current_attempt
+            remaining_attempts = XINFERENCE_DOWNLOAD_MAX_ATTEMPTS - current_attempt
             last_ex = e
             logger.debug(
                 "Download failed: %s, download func: %s, download args: %s, kwargs: %s",
@@ -118,7 +147,9 @@ def retry_download(
 
 
 def valid_model_revision(
-    meta_path: str, expected_model_revision: Optional[str]
+    meta_path: str,
+    expected_model_revision: Optional[str],
+    expected_model_hub: Optional[str] = None,
 ) -> bool:
     if not os.path.exists(meta_path):
         return False
@@ -138,13 +169,21 @@ def valid_model_revision(
                 f"No `revision` information in the `__valid_download` file. "
             )
             return False
-        return real_revision == expected_model_revision
+        if expected_model_hub is not None and expected_model_hub != meta_data.get(
+            "model_hub", "huggingface"
+        ):
+            logger.info("Use model cache from a different hub.")
+            return True
+        else:
+            return real_revision == expected_model_revision
+
+
+def get_cache_dir(model_spec: Any) -> str:
+    return os.path.realpath(os.path.join(XINFERENCE_CACHE_DIR, model_spec.model_name))
 
 
 def is_model_cached(model_spec: Any, name_to_revisions_mapping: Dict):
-    cache_dir = os.path.realpath(
-        os.path.join(XINFERENCE_CACHE_DIR, model_spec.model_name)
-    )
+    cache_dir = get_cache_dir(model_spec)
     meta_path = os.path.join(cache_dir, "__valid_download")
     revisions = name_to_revisions_mapping[model_spec.model_name]
     if model_spec.model_revision not in revisions:  # Usually for UT
@@ -153,8 +192,13 @@ def is_model_cached(model_spec: Any, name_to_revisions_mapping: Dict):
 
 
 def is_valid_model_name(model_name: str) -> bool:
-    model_name = model_name.strip()
-    return 0 < len(model_name) <= 100
+    import re
+
+    if len(model_name) == 0:
+        return False
+
+    # check if contains +/?%#&=\s
+    return re.match(r"^[^+\/?%#&=\s]*$", model_name) is not None
 
 
 def parse_uri(uri: str) -> Tuple[str, str]:
@@ -187,99 +231,115 @@ def is_valid_model_uri(model_uri: Optional[str]) -> bool:
         return True
 
 
-def copy_from_src_to_dst(
-    _src_fs: "AbstractFileSystem",
-    _src_path: str,
-    dst_fs: "AbstractFileSystem",
-    dst_path: str,
-    max_attempt: int = 3,
-):
-    from tqdm import tqdm
+def cache_from_uri(model_spec: CacheableModelSpec) -> str:
+    cache_dir = os.path.realpath(
+        os.path.join(XINFERENCE_CACHE_DIR, model_spec.model_name)
+    )
+    if os.path.exists(cache_dir):
+        logger.info("cache %s exists", cache_dir)
+        return cache_dir
 
-    for attempt in range(max_attempt):
-        logger.info(f"Copy from {_src_path} to {dst_path}, attempt: {attempt}")
-        try:
-            with _src_fs.open(_src_path, "rb") as src_file:
-                file_size = _src_fs.info(_src_path)["size"]
+    assert model_spec.model_uri is not None
+    src_scheme, src_root = parse_uri(model_spec.model_uri)
+    if src_root.endswith("/"):
+        # remove trailing path separator.
+        src_root = src_root[:-1]
 
-                dst_fs.makedirs(os.path.dirname(dst_path), exist_ok=True)
-                with dst_fs.open(dst_path, "wb") as dst_file:
-                    chunk_size = 1024 * 1024  # 1 MB
-
-                    with tqdm(
-                        total=file_size,
-                        unit="B",
-                        unit_scale=True,
-                        unit_divisor=1024,
-                        desc=_src_path,
-                    ) as pbar:
-                        while True:
-                            chunk = src_file.read(chunk_size)
-                            if not chunk:
-                                break
-                            dst_file.write(chunk)
-                            pbar.update(len(chunk))
-            logger.info(
-                f"Copy from {_src_path} to {dst_path} finished, attempt: {attempt}"
+    if src_scheme == "file":
+        if not os.path.isabs(src_root):
+            raise ValueError(
+                f"Model URI cannot be a relative path: {model_spec.model_uri}"
             )
-            break
-        except:
-            logger.error(
-                f"Failed to copy from {_src_path} to {dst_path} on attempt {attempt + 1}",
-                exc_info=True,
-            )
-            if attempt + 1 == max_attempt:
-                raise
-
-
-def patch_trust_remote_code():
-    """sentence-transformers calls transformers without the trust_remote_code=True, some embedding
-    models will fail to load, e.g. jina-embeddings-v2-base-en
-
-    :return:
-    """
-    try:
-        from transformers.dynamic_module_utils import resolve_trust_remote_code
-    except ImportError:
-        logger.error("Patch transformers trust_remote_code failed.")
+        os.makedirs(XINFERENCE_CACHE_DIR, exist_ok=True)
+        os.symlink(src_root, cache_dir, target_is_directory=True)
+        return cache_dir
     else:
+        raise ValueError(f"Unsupported URL scheme: {src_scheme}")
 
-        def _patched_resolve_trust_remote_code(*args, **kwargs):
-            logger.info("Patched resolve_trust_remote_code: %s %s", args, kwargs)
-            return True
 
-        if (
-            resolve_trust_remote_code.__code__
-            != _patched_resolve_trust_remote_code.__code__
-        ):
-            resolve_trust_remote_code.__code__ = (
-                _patched_resolve_trust_remote_code.__code__
-            )
+def cache(model_spec: CacheableModelSpec, model_description_type: type):
+    if (
+        hasattr(model_spec, "model_uri")
+        and getattr(model_spec, "model_uri", None) is not None
+    ):
+        logger.info(f"Model caching from URI: {model_spec.model_uri}")
+        return cache_from_uri(model_spec=model_spec)
+
+    cache_dir = os.path.realpath(
+        os.path.join(XINFERENCE_CACHE_DIR, model_spec.model_name)
+    )
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir, exist_ok=True)
+    meta_path = os.path.join(cache_dir, "__valid_download")
+    if valid_model_revision(meta_path, model_spec.model_revision, model_spec.model_hub):
+        return cache_dir
+
+    from_modelscope: bool = model_spec.model_hub == "modelscope"
+    if from_modelscope:
+        from modelscope.hub.snapshot_download import snapshot_download as ms_download
+
+        download_dir = retry_download(
+            ms_download,
+            model_spec.model_name,
+            None,
+            model_spec.model_id,
+            revision=model_spec.model_revision,
+        )
+        create_symlink(download_dir, cache_dir)
+    else:
+        from huggingface_hub import snapshot_download as hf_download
+
+        use_symlinks = {}
+        if not IS_NEW_HUGGINGFACE_HUB:
+            use_symlinks = {"local_dir_use_symlinks": True, "local_dir": cache_dir}
+        download_dir = retry_download(
+            hf_download,
+            model_spec.model_name,
+            None,
+            model_spec.model_id,
+            revision=model_spec.model_revision,
+            **use_symlinks,
+        )
+        if IS_NEW_HUGGINGFACE_HUB:
+            create_symlink(download_dir, cache_dir)
+    with open(meta_path, "w") as f:
+        import json
+
+        desc = model_description_type(None, None, model_spec)
+        json.dump(desc.to_dict(), f)
+    return cache_dir
 
 
 def select_device(device):
     try:
-        import torch
+        import torch  # noqa: F401
     except ImportError:
         raise ImportError(
             f"Failed to import module 'torch'. Please make sure 'torch' is installed.\n\n"
         )
 
     if device == "auto":
-        # When env CUDA_VISIBLE_DEVICES=-1, torch.cuda.is_available() return False
-        if torch.cuda.is_available():
-            return "cuda"
-        elif torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
-    elif device == "cuda":
-        if not torch.cuda.is_available():
-            raise ValueError("cuda is unavailable in your environment")
-    elif device == "mps":
-        if not torch.backends.mps.is_available():
-            raise ValueError("mps is unavailable in your environment")
-    elif device == "cpu":
-        pass
+        return get_available_device()
     else:
-        raise ValueError(f"Device {device} is not supported in temporary")
+        if not is_device_available(device):
+            raise ValueError(f"{device} is unavailable in your environment")
+
     return device
+
+
+def convert_float_to_int_or_str(model_size: float) -> Union[int, str]:
+    """convert float to int or string
+
+    if float can be presented as int, convert it to int, otherwise convert it to string
+    """
+    if int(model_size) == model_size:
+        return int(model_size)
+    else:
+        return str(model_size)
+
+
+def set_all_random_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)

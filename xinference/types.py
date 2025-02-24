@@ -14,31 +14,27 @@
 
 from typing import Any, Callable, Dict, ForwardRef, Iterable, List, Optional, Union
 
-from pydantic import (
+from typing_extensions import Literal, NotRequired, TypedDict
+
+from ._compat import (
     BaseModel,
     create_model,
     create_model_from_typeddict,
     validate_arguments,
 )
-from typing_extensions import Literal, NotRequired, TypedDict
-
 from .fields import (
     echo_field,
-    frequency_penalty_field,
-    logprobs_field,
     max_tokens_field,
     none_field,
-    presence_penalty_field,
     repeat_penalty_field,
     stop_field,
     stream_field,
     stream_interval_field,
+    stream_option_field,
     temperature_field,
     top_k_field,
     top_p_field,
 )
-
-SPECIAL_TOOL_PROMPT = "<TOOL>"
 
 
 class Image(TypedDict):
@@ -51,6 +47,22 @@ class ImageList(TypedDict):
     data: List[Image]
 
 
+class SDAPIResult(TypedDict):
+    images: List[str]
+    parameters: dict
+    info: dict
+
+
+class Video(TypedDict):
+    url: Optional[str]
+    b64_json: Optional[str]
+
+
+class VideoList(TypedDict):
+    created: int
+    data: List[Video]
+
+
 class EmbeddingUsage(TypedDict):
     prompt_tokens: int
     total_tokens: int
@@ -59,7 +71,8 @@ class EmbeddingUsage(TypedDict):
 class EmbeddingData(TypedDict):
     index: int
     object: str
-    embedding: List[float]
+    # support sparse embedding
+    embedding: Union[List[float], Dict[str, float]]
 
 
 class Embedding(TypedDict):
@@ -79,9 +92,37 @@ class DocumentObj(TypedDict):
     document: Optional[Document]
 
 
+# Cohere API compatibility
+class ApiVersion(TypedDict):
+    version: str
+    is_deprecated: bool
+    is_experimental: bool
+
+
+# Cohere API compatibility
+class BilledUnit(TypedDict):
+    input_tokens: int
+    output_tokens: int
+    search_units: int
+    classifications: int
+
+
+class RerankTokens(TypedDict):
+    input_tokens: int
+    output_tokens: int
+
+
+class Meta(TypedDict):
+    api_version: Optional[ApiVersion]
+    billed_units: Optional[BilledUnit]
+    tokens: RerankTokens
+    warnings: Optional[List[str]]
+
+
 class Rerank(TypedDict):
     id: str
     results: List[DocumentObj]
+    meta: Meta
 
 
 class CompletionLogprobs(TypedDict):
@@ -91,11 +132,23 @@ class CompletionLogprobs(TypedDict):
     top_logprobs: List[Optional[Dict[str, float]]]
 
 
+class ToolCallFunction(TypedDict):
+    name: str
+    arguments: str
+
+
+class ToolCalls(TypedDict):
+    id: str
+    type: Literal["function"]
+    function: ToolCallFunction
+
+
 class CompletionChoice(TypedDict):
-    text: str
+    text: NotRequired[str]
     index: int
     logprobs: Optional[CompletionLogprobs]
     finish_reason: Optional[str]
+    tool_calls: NotRequired[List[ToolCalls]]
 
 
 class CompletionUsage(TypedDict):
@@ -110,6 +163,7 @@ class CompletionChunk(TypedDict):
     created: int
     model: str
     choices: List[CompletionChoice]
+    usage: NotRequired[CompletionUsage]
 
 
 class Completion(TypedDict):
@@ -123,6 +177,7 @@ class Completion(TypedDict):
 
 class ChatCompletionMessage(TypedDict):
     role: str
+    reasoning_content: NotRequired[str]
     content: Optional[str]
     user: NotRequired[str]
     tool_calls: NotRequired[List]
@@ -145,7 +200,9 @@ class ChatCompletion(TypedDict):
 
 class ChatCompletionChunkDelta(TypedDict):
     role: NotRequired[str]
+    reasoning_content: NotRequired[str]
     content: NotRequired[str]
+    tool_calls: NotRequired[List[ToolCalls]]
 
 
 class ChatCompletionChunkChoice(TypedDict):
@@ -160,28 +217,7 @@ class ChatCompletionChunk(TypedDict):
     object: Literal["chat.completion.chunk"]
     created: int
     choices: List[ChatCompletionChunkChoice]
-
-
-class ChatglmCppModelConfig(TypedDict, total=False):
-    pass
-
-
-class ChatglmCppGenerateConfig(TypedDict, total=False):
-    max_tokens: int
-    top_p: float
-    temperature: float
-    stream: bool
-
-
-class QWenCppModelConfig(TypedDict, total=False):
-    pass
-
-
-class QWenCppGenerateConfig(TypedDict, total=False):
-    max_tokens: int
-    top_p: float
-    temperature: float
-    stream: bool
+    usage: NotRequired[CompletionUsage]
 
 
 StoppingCriteria = Callable[[List[int], List[float]], bool]
@@ -215,6 +251,7 @@ class LlamaCppGenerateConfig(TypedDict, total=False):
     repetition_penalty: float
     top_k: int
     stream: bool
+    stream_options: Optional[Union[dict, None]]
     tfs_z: float
     mirostat_mode: int
     mirostat_tau: float
@@ -230,13 +267,14 @@ class LlamaCppModelConfig(TypedDict, total=False):
     n_ctx: int
     n_parts: int
     n_gpu_layers: int
+    split_mode: int
+    main_gpu: int
     seed: int
     f16_kv: bool
     logits_all: bool
     vocab_only: bool
     use_mmap: bool
     use_mlock: bool
-    embedding: bool
     n_threads: Optional[int]
     n_batch: int
     last_n_tokens_size: int
@@ -261,6 +299,22 @@ class PytorchGenerateConfig(TypedDict, total=False):
     stream_interval: int
     model: Optional[str]
     tools: Optional[List[Dict]]
+    lora_name: Optional[str]
+    stream_options: Optional[Union[dict, None]]
+    request_id: Optional[str]
+
+
+class CogagentGenerateConfig(PytorchGenerateConfig, total=False):
+    platform: Optional[Literal["Mac", "WIN", "Mobile"]]
+    format: Optional[
+        Literal[
+            "(Answer in Action-Operation-Sensitive format.)",
+            "(Answer in Status-Plan-Action-Operation format.)",
+            "(Answer in Status-Action-Operation-Sensitive format.)",
+            "(Answer in Status-Action-Operation format.)",
+            "(Answer in Action-Operation format.)",
+        ]
+    ]
 
 
 class PytorchModelConfig(TypedDict, total=False):
@@ -274,6 +328,8 @@ class PytorchModelConfig(TypedDict, total=False):
     gptq_groupsize: int
     gptq_act_order: bool
     trust_remote_code: bool
+    max_num_seqs: int
+    enable_tensorizer: Optional[bool]
 
 
 def get_pydantic_model_from_method(
@@ -281,8 +337,10 @@ def get_pydantic_model_from_method(
     exclude_fields: Optional[Iterable[str]] = None,
     include_fields: Optional[Dict[str, Any]] = None,
 ) -> BaseModel:
+    # The validate_arguments set Config.extra = "forbid" by default.
     f = validate_arguments(meth, config={"arbitrary_types_allowed": True})
     model = f.model
+    model.Config.extra = "ignore"
     model.__fields__.pop("self", None)
     model.__fields__.pop("args", None)
     model.__fields__.pop("kwargs", None)
@@ -327,15 +385,18 @@ class ModelAndPrompt(BaseModel):
 
 class CreateCompletionTorch(BaseModel):
     echo: bool = echo_field
-    max_tokens: int = max_tokens_field
+    max_tokens: Optional[int] = max_tokens_field
     repetition_penalty: float = repeat_penalty_field
     stop: Optional[Union[str, List[str]]] = stop_field
     stop_token_ids: Optional[Union[int, List[int]]] = none_field
     stream: bool = stream_field
+    stream_options: Optional[Union[dict, None]] = stream_option_field
     stream_interval: int = stream_interval_field
     temperature: float = temperature_field
     top_p: float = top_p_field
     top_k: int = top_k_field
+    lora_name: Optional[str]
+    request_id: Optional[str]
 
 
 CreateCompletionLlamaCpp: BaseModel
@@ -344,73 +405,34 @@ try:
 
     CreateCompletionLlamaCpp = get_pydantic_model_from_method(
         Llama.create_completion,
-        exclude_fields=["model", "prompt", "grammar"],
-        include_fields={"grammar": (Optional[Any], None)},
-    )
-except ImportError:
-    CreateCompletionLlamaCpp = create_model("CreateCompletionLlamaCpp")
-
-CreateCompletionCTransformers: BaseModel
-try:
-    from ctransformers.llm import LLM
-
-    CreateCompletionCTransformers = get_pydantic_model_from_method(
-        LLM.generate,
-        exclude_fields=["tokens"],
+        exclude_fields=["model", "prompt", "grammar", "max_tokens"],
         include_fields={
+            "grammar": (Optional[Any], None),
             "max_tokens": (Optional[int], max_tokens_field),
-            "stream": (Optional[bool], stream_field),
+            "lora_name": (Optional[str], None),
+            "stream_options": (Optional[Union[dict, None]], None),
         },
     )
 except ImportError:
-    CreateCompletionCTransformers = create_model("CreateCompletionCTransformers")
+    CreateCompletionLlamaCpp = create_model("CreateCompletionLlamaCpp")
 
 
 # This type is for openai API compatibility
 CreateCompletionOpenAI: BaseModel
 
 
-class _CreateCompletionOpenAIFallback(BaseModel):
-    # OpenAI's create completion request body, we define it by pydantic
-    # model to verify the input params.
-    # https://platform.openai.com/docs/api-reference/completions/object
-    model: str
-    prompt: str
-    best_of: Optional[int] = 1
-    echo: bool = echo_field
-    frequency_penalty: Optional[float] = frequency_penalty_field
-    logit_bias: Optional[Dict[str, float]] = none_field
-    logprobs: Optional[int] = logprobs_field
-    max_tokens: int = max_tokens_field
-    n: Optional[int] = 1
-    presence_penalty: Optional[float] = presence_penalty_field
-    seed: Optional[int] = none_field
-    stop: Optional[Union[str, List[str]]] = stop_field
-    stream: bool = stream_field
-    suffix: Optional[str] = none_field
-    temperature: float = temperature_field
-    top_p: float = top_p_field
-    user: Optional[str] = none_field
+from openai.types.completion_create_params import CompletionCreateParamsNonStreaming
 
-
-try:
-    # For openai > 1
-    from openai.types.completion_create_params import CompletionCreateParamsNonStreaming
-
-    CreateCompletionOpenAI = create_model_from_typeddict(
-        CompletionCreateParamsNonStreaming,
-    )
-    CreateCompletionOpenAI = fix_forward_ref(CreateCompletionOpenAI)
-except ImportError:
-    # TODO(codingl2k1): Remove it if openai < 1 is dropped.
-    CreateCompletionOpenAI = _CreateCompletionOpenAIFallback
+CreateCompletionOpenAI = create_model_from_typeddict(
+    CompletionCreateParamsNonStreaming,
+)
+CreateCompletionOpenAI = fix_forward_ref(CreateCompletionOpenAI)
 
 
 class CreateCompletion(
     ModelAndPrompt,
     CreateCompletionTorch,
     CreateCompletionLlamaCpp,
-    CreateCompletionCTransformers,
     CreateCompletionOpenAI,
 ):
     pass
@@ -423,29 +445,70 @@ class CreateChatModel(BaseModel):
 # Currently, chat calls generates, so the params share the same one.
 CreateChatCompletionTorch = CreateCompletionTorch
 CreateChatCompletionLlamaCpp: BaseModel = CreateCompletionLlamaCpp
-CreateChatCompletionCTransformers: BaseModel = CreateCompletionCTransformers
 
 
-# This type is for openai API compatibility
-CreateChatCompletionOpenAI: BaseModel
+from ._compat import CreateChatCompletionOpenAI
 
 
-# Only support openai > 1
-from openai.types.chat.completion_create_params import (
-    CompletionCreateParamsNonStreaming,
-)
-
-CreateChatCompletionOpenAI = create_model_from_typeddict(
-    CompletionCreateParamsNonStreaming,
-)
-CreateChatCompletionOpenAI = fix_forward_ref(CreateChatCompletionOpenAI)
-
-
-class CreateChatCompletion(
+class CreateChatCompletion(  # type: ignore
     CreateChatModel,
     CreateChatCompletionTorch,
     CreateChatCompletionLlamaCpp,
-    CreateChatCompletionCTransformers,
     CreateChatCompletionOpenAI,
 ):
     pass
+
+
+class LoRA:
+    def __init__(self, lora_name: str, local_path: str):
+        self.lora_name = lora_name
+        self.local_path = local_path
+
+    def to_dict(self):
+        return {
+            "lora_name": self.lora_name,
+            "local_path": self.local_path,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict):
+        return cls(
+            lora_name=data["lora_name"],
+            local_path=data["local_path"],
+        )
+
+
+class PeftModelConfig:
+    def __init__(
+        self,
+        peft_model: Optional[List[LoRA]] = None,
+        image_lora_load_kwargs: Optional[Dict] = None,
+        image_lora_fuse_kwargs: Optional[Dict] = None,
+    ):
+        self.peft_model = peft_model
+        self.image_lora_load_kwargs = image_lora_load_kwargs
+        self.image_lora_fuse_kwargs = image_lora_fuse_kwargs
+
+    def to_dict(self):
+        return {
+            "lora_list": [lora.to_dict() for lora in self.peft_model]
+            if self.peft_model
+            else None,
+            "image_lora_load_kwargs": self.image_lora_load_kwargs,
+            "image_lora_fuse_kwargs": self.image_lora_fuse_kwargs,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict):
+        peft_model_list = data.get("lora_list", None)
+        peft_model = (
+            [LoRA.from_dict(lora_dict) for lora_dict in peft_model_list]
+            if peft_model_list is not None
+            else None
+        )
+
+        return cls(
+            peft_model=peft_model,
+            image_lora_load_kwargs=data.get("image_lora_load_kwargs"),
+            image_lora_fuse_kwargs=data.get("image_lora_fuse_kwargs"),
+        )

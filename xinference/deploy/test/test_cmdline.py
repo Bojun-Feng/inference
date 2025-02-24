@@ -19,12 +19,15 @@ from click.testing import CliRunner
 
 from ...client import Client
 from ..cmdline import (
+    list_cached_models,
     list_model_registrations,
     model_chat,
     model_generate,
+    model_launch,
     model_list,
     model_terminate,
     register_model,
+    remove_cache,
     unregister_model,
 )
 
@@ -64,9 +67,10 @@ def test_cmdline(setup, stream, model_uid):
     replica = 1
     original_model_uid = model_uid
     model_uid = client.launch_model(
-        model_name="orca",
+        model_name="qwen1.5-chat",
+        model_engine="llama.cpp",
         model_uid=model_uid,
-        model_size_in_billions=3,
+        model_size_in_billions="0_5",
         quantization="q4_0",
         replica=replica,
     )
@@ -143,6 +147,38 @@ def test_cmdline(setup, stream, model_uid):
     assert model_uid not in result.stdout
 
 
+def test_cmdline_model_path_error(setup):
+    endpoint, _ = setup
+    runner = CliRunner(mix_stderr=False)
+
+    # launch model
+    result = runner.invoke(
+        model_launch,
+        [
+            "--endpoint",
+            endpoint,
+            "--model-name",
+            "tiny-llama",
+            "--size-in-billions",
+            1,
+            "--model-format",
+            "ggufv2",
+            "--quantization",
+            "Q2_K",
+            "--model-path",
+            "/path/to/model",
+            "--model_path",
+            "/path/to/model",
+        ],
+    )
+    assert result.exit_code > 0
+    with pytest.raises(
+        ValueError, match="Cannot set both for --model-path and --model_path"
+    ):
+        t, e, tb = result.exc_info
+        raise e.with_traceback(tb)
+
+
 def test_cmdline_of_custom_model(setup):
     endpoint, _ = setup
     runner = CliRunner()
@@ -159,6 +195,7 @@ def test_cmdline_of_custom_model(setup):
     "embed",
     "chat"
   ],
+  "model_family": "other",
   "model_specs": [
     {
       "model_format": "pytorch",
@@ -245,9 +282,10 @@ def test_rotate_logs(setup_with_file_logging):
     runner = CliRunner()
     replica = 1 if os.name == "nt" else 2
     model_uid = client.launch_model(
-        model_name="orca",
+        model_name="qwen1.5-chat",
+        model_engine="llama.cpp",
         model_uid=None,
-        model_size_in_billions=3,
+        model_size_in_billions="0_5",
         quantization="q4_0",
         replica=replica,
     )
@@ -275,3 +313,89 @@ def test_rotate_logs(setup_with_file_logging):
     with open(log_file, "r") as f:
         content = f.read()
         assert len(content) > 0
+
+
+def test_list_cached_models(setup):
+    endpoint, _ = setup
+    runner = CliRunner()
+
+    result = runner.invoke(
+        list_cached_models,
+        ["--endpoint", endpoint, "--model_name", "qwen1.5-chat"],
+    )
+    assert "model_name" in result.stdout
+    assert "model_format" in result.stdout
+    assert "model_size_in_billions" in result.stdout
+    assert "quantization" in result.stdout
+    assert "model_version" in result.stdout
+    assert "path" in result.stdout
+    assert "actor_ip_address" in result.stdout
+
+
+def test_remove_cache(setup):
+    endpoint, _ = setup
+    runner = CliRunner()
+
+    result = runner.invoke(
+        remove_cache,
+        ["--endpoint", endpoint, "--model_version", "qwen1.5-chat"],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0
+    assert "Cache directory qwen1.5-chat has been deleted."
+
+
+def test_launch_error_in_passing_parameters():
+    runner = CliRunner()
+
+    # Known parameter but not provided with value.
+    result = runner.invoke(
+        model_launch,
+        [
+            "--model-engine",
+            "transformers",
+            "--model-name",
+            "qwen2.5-instruct",
+            "--model-uid",
+            "-s",
+            "0.5",
+            "-f",
+            "gptq",
+            "-q",
+            "INT4",
+            "111",
+            "-l",
+        ],
+    )
+    assert result.exit_code == 1
+    assert (
+        "You must specify extra kwargs with `--` prefix. There is an error in parameter passing that is 0.5."
+        in str(result)
+    )
+
+    # Unknown parameter
+    result = runner.invoke(
+        model_launch,
+        [
+            "--model-engine",
+            "transformers",
+            "--model-name",
+            "qwen2.5-instruct",
+            "--model-uid",
+            "123",
+            "-s",
+            "0.5",
+            "-f",
+            "gptq",
+            "-q",
+            "INT4",
+            "-l",
+            "111",
+        ],
+    )
+    assert result.exit_code == 1
+    assert (
+        "You must specify extra kwargs with `--` prefix. There is an error in parameter passing that is -l."
+        in str(result)
+    )
