@@ -23,7 +23,7 @@ import xoscar as xo
 from xoscar.utils import get_next_port
 
 from ..constants import (
-    XINFERENCE_HEALTH_CHECK_ATTEMPTS,
+    XINFERENCE_HEALTH_CHECK_FAILURE_THRESHOLD,
     XINFERENCE_HEALTH_CHECK_INTERVAL,
 )
 from ..core.supervisor import SupervisorActor
@@ -41,7 +41,7 @@ async def _start_supervisor(address: str, logging_conf: Optional[Dict] = None):
             address=address, n_process=0, logging_conf={"dict": logging_conf}
         )
         await xo.create_actor(
-            SupervisorActor, address=address, uid=SupervisorActor.uid()
+            SupervisorActor, address=address, uid=SupervisorActor.default_uid()
         )
         await pool.join()
     except asyncio.exceptions.CancelledError:
@@ -75,13 +75,14 @@ def main(
     port: int,
     supervisor_port: Optional[int],
     logging_conf: Optional[Dict] = None,
+    auth_config_file: Optional[str] = None,
 ):
     supervisor_address = f"{host}:{supervisor_port or get_next_port()}"
     local_cluster = run_in_subprocess(supervisor_address, logging_conf)
 
     if not health_check(
         address=supervisor_address,
-        max_attempts=XINFERENCE_HEALTH_CHECK_ATTEMPTS,
+        max_attempts=XINFERENCE_HEALTH_CHECK_FAILURE_THRESHOLD,
         sleep_interval=XINFERENCE_HEALTH_CHECK_INTERVAL,
     ):
         raise RuntimeError("Supervisor is not available after multiple attempts")
@@ -94,6 +95,7 @@ def main(
             host=host,
             port=port,
             logging_conf=logging_conf,
+            auth_config_file=auth_config_file,
         )
     finally:
-        local_cluster.terminate()
+        local_cluster.kill()

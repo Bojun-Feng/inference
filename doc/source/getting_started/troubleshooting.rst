@@ -32,12 +32,6 @@ Your credential to access huggingface can be found online at `https://huggingfac
 
 You can set the token as an environmental variable, with ``export HUGGING_FACE_HUB_TOKEN=your_token_here``.
 
-Download models from ModelScope
-===============================
-
-When the network connection to HuggingFace is blocked, you can also choose to download models from ModelScope, especially for Chinese users.
-For a detailed list of supported models and settings, please refer to :ref:`models_download`.
-
 
 Incompatibility Between NVIDIA Driver and PyTorch Version
 =========================================================
@@ -63,3 +57,53 @@ Say if your CUDA driver version is 11.8, then you can install PyTorch with the f
 .. code-block:: python
 
    pip install torch==2.0.1+cu118
+
+
+Xinference service cannot be accessed from external systems through ``<IP>:9997``
+=================================================================================
+
+Use ``-H 0.0.0.0`` parameter in when starting Xinference:
+
+.. code:: bash
+
+   xinference-local -H 0.0.0.0
+
+Then Xinference service will listen on all network interfaces (not limited to ``127.0.0.1`` or ``localhost``).
+
+If you are using the :ref:`using_docker_image`, please add ``-p <PORT>:9997``
+during the docker run command, then access is available through ``<IP>:<PORT>`` of
+the local machine.
+
+Launching a built-in model takes a long time, and sometimes the model fails to download
+=======================================================================================
+
+Xinference by default uses HuggingFace as the source for models. If your
+machines are in Mainland China, there might be accessibility issues when
+using built-in models.
+
+To address this, add environment variable ``XINFERENCE_MODEL_SRC=modelscope`` when starting
+the Xinference to change the model source to ModelScope, which is optimized
+for Mainland China.
+
+If you’re starting Xinference with Docker, include ``-e XINFERENCE_MODEL_SRC=modelscope``
+during the docker run command.
+
+When using the official Docker image, RayWorkerVllm died due to OOM, causing the model to fail to load
+=======================================================================================================
+
+Docker's ``--shm-size`` parameter is used to set the size of shared memory. 
+The default size of shared memory (/dev/shm) is 64MB, which may be too small for vLLM backend.
+
+
+You can increase its size by setting the ``--shm-size`` parameter as follows:
+
+.. code:: bash
+
+   docker run --shm-size=128g ...
+
+
+Missing ``model_engine`` parameter when launching LLM models
+============================================================
+
+Since version ``v0.11.0``, launching LLM models requires an additional ``model_engine`` parameter.
+For specific information, please refer to :ref:`here <about_model_engine>`.

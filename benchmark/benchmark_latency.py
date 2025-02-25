@@ -16,29 +16,27 @@ import argparse
 import asyncio
 import logging
 import random
-import time
-from typing import List, Tuple
 
 import numpy as np
-from utils import get_tokenizer, sample_requests, send_request
+from utils import get_tokenizer, sample_requests
+from benchmark_runner import BenchmarkRunner
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-REQUEST_LATENCY: List[Tuple[int, int, float]] = []
 
-
-async def benchmark(
-    api_url: str,
-    model_uid: str,
-    input_requests: List[Tuple[str, int, int]],
-    best_of: int,
-) -> None:
-    for request in input_requests:
-        prompt, prompt_len, output_len = request
-        await send_request(
-            api_url, model_uid, prompt, prompt_len, output_len, best_of, REQUEST_LATENCY
-        )
+class LatencyBenchmarkRunner(BenchmarkRunner):
+    async def _run(self):
+        total_requests = len(self.input_requests)
+        for i, request in enumerate(self.input_requests):
+            await self.send_request(request)
+            remaining = total_requests - (i + 1)
+            print(
+                f"\rProcessed {i + 1}/{total_requests} requests, {remaining} remaining.",
+                end="",
+            )
+        print("")
 
 
 def main(args: argparse.Namespace):
@@ -54,36 +52,18 @@ def main(args: argparse.Namespace):
     input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
 
     logger.info("Benchmark starts.")
-    benchmark_start_time = time.time()
 
-    asyncio.run(
-        benchmark(
-            api_url,
-            model_uid,
-            input_requests,
-            args.best_of,
-        )
+    benchmark = LatencyBenchmarkRunner(
+        api_url,
+        model_uid,
+        input_requests,
+        args.stream,
+        args.api_key,
+        args.print_error,
     )
+    asyncio.run(benchmark.run())
 
-    benchmark_end_time = time.time()
-    benchmark_time = benchmark_end_time - benchmark_start_time
-    print(f"Total time: {benchmark_time:.2f} s")
-    print(f"Throughput: {len(REQUEST_LATENCY) / benchmark_time:.2f} requests/s")
-
-    # Compute the latency statistics.
-    avg_latency = np.mean([latency for _, _, latency in REQUEST_LATENCY])
-    print(f"Average latency: {avg_latency:.2f} s")
-    avg_per_token_latency = np.mean(
-        [
-            latency / (prompt_len + output_len)
-            for prompt_len, output_len, latency in REQUEST_LATENCY
-        ]
-    )
-    print(f"Average latency per token: {avg_per_token_latency:.2f} s")
-    avg_per_output_token_latency = np.mean(
-        [latency / output_len for _, output_len, latency in REQUEST_LATENCY]
-    )
-    print("Average latency per output token: " f"{avg_per_output_token_latency:.2f} s")
+    benchmark.print_stats()
 
 
 if __name__ == "__main__":
@@ -99,12 +79,6 @@ if __name__ == "__main__":
         "--tokenizer", type=str, required=True, help="Name or path of the tokenizer."
     )
     parser.add_argument(
-        "--best-of",
-        type=int,
-        default=1,
-        help="Generates `best_of` sequences per prompt and " "returns the best one.",
-    )
-    parser.add_argument(
         "--num-prompts", type=int, default=100, help="Number of prompts to process."
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -114,6 +88,19 @@ if __name__ == "__main__":
         help="Trust remote code from huggingface.",
     )
     parser.add_argument("--model-uid", type=str, help="Xinference model UID.")
-
+    parser.add_argument(
+        "--stream", action="store_true", help="Enable streaming responses."
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="Authorization api key",
+    )
+    parser.add_argument(
+        "--print-error",
+        action="store_true",
+        help="Print detailed error messages if any errors encountered."
+    )
     args = parser.parse_args()
     main(args)
